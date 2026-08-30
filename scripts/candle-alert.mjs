@@ -53,14 +53,32 @@ const HOLIDAYS = new Set([
 const isTradingDay = (et) =>
   !['Sat', 'Sun'].includes(et.wd) && !HOLIDAYS.has(et.date);
 
+/** 下一个交易日（跳过周末与假日） */
+function nextTradingDay(et) {
+  const d = new Date(`${et.date}T12:00:00Z`);
+  for (let i = 0; i < 12; i++) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const iso = d.toISOString().slice(0, 10);
+    const wd = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getUTCDay()];
+    if (!['Sat', 'Sun'].includes(wd) && !HOLIDAYS.has(iso)) return { date: iso, wd };
+  }
+  return null;
+}
+const WD_CN = { Mon: '\u5468\u4e00', Tue: '\u5468\u4e8c', Wed: '\u5468\u4e09', Thu: '\u5468\u56db',
+                Fri: '\u5468\u4e94', Sat: '\u5468\u516d', Sun: '\u5468\u65e5' };
+
 /** 根据美东时间判断这一跑属于哪个时段 */
 function session(et) {
   const m = et.hour * 60 + et.minute;
-  // 窗口刻意做窄：同一个 cron 写两个 UTC 时点（兼容夏令时/冬令时），
+  // 休市日（周末 / 假日）：一天只在这一个窗口播报一次
+  if (!isTradingDay(et)) {
+    return (m >= 10 * 60 && m < 11 * 60 + 30) ? 'CLOSED' : null;  // 10:00\u201311:29
+  }
+  // 交易日：窗口刻意做窄：同一个时段写两个 UTC cron（兼容夏令时/冬令时），
   // 只有落在窗口内的那一次会真的发消息，另一次自动退出。
-  if (m >= 8 * 60 + 15 && m < 9 * 60 + 30)  return 'PRE';   // 08:15–09:29 盘前
-  if (m >= 12 * 60 + 10 && m < 13 * 60 + 20) return 'MID';  // 12:10–13:19 盘中
-  if (m >= 16 * 60 + 10 && m < 17 * 60 + 20) return 'POST'; // 16:10–17:19 盘后
+  if (m >= 8 * 60 + 15 && m < 9 * 60 + 30)   return 'PRE';   // 08:15\u201309:29 \u76d8\u524d
+  if (m >= 12 * 60 + 10 && m < 13 * 60 + 20) return 'MID';   // 12:10\u201313:19 \u76d8\u4e2d
+  if (m >= 16 * 60 + 10 && m < 17 * 60 + 20) return 'POST';  // 16:10\u201317:19 \u76d8\u540e
   return null;
 }
 
@@ -162,6 +180,33 @@ function signals(bars) {
   }));
 }
 
+/**
+ * 算出「下一个交易日开盘价落在什么位置，会让 G8 跳空信号触发」。
+ * 因为 G8 只用到今开与昨收，所以它是唯一能提前折算成一个具体价位的信号。
+ * 注意：在第 i 根触发的信号，是在第 i+1 根的开盘执行 —— 所以是「后天开盘动手」。
+ */
+function gapTrigger(bars) {
+  const n = bars.length;
+  const w = [];
+  for (let i = n - WIN + 1; i < n; i++) {           // 最近 WIN-1 = 59 个历史值
+    if (i < 1) return null;
+    const v = (bars[i].o - bars[i - 1].c) / bars[i - 1].c;
+    if (!isFinite(v)) return null;
+    w.push(v);
+  }
+  if (w.length < WIN - 1) return null;
+  const sorted = [...w].sort((a, b) => a - b);
+  const prev = bars[n - 1].c;
+  const kUp = Math.ceil(HI * w.length);             // 需要至少这么多历史值小于它
+  const kDn = Math.floor(LO * w.length);            // 最多只能有这么多历史值小于它
+  // 取整到分：向外各让一档，让「≥ / ≤ 这个报价」一定落在触发区间内
+  return {
+    up:   Math.ceil(prev * (1 + sorted[kUp - 1]) * 100) / 100,   // 开盘 ≥ 此价 → 触发 +1
+    down: Math.floor(prev * (1 + sorted[kDn]) * 100) / 100,      // 开盘 ≤ 此价 → 触发 -1
+    prev,
+  };
+}
+
 // ── 重放持仓状态（与 Python 回测 run() 逐行等价）──────────────────
 function replay(bars, sig) {
   let pos = 0, ep = 0, epDate = null, pend = 0, trades = 0, wins = 0, eq = 1;
@@ -197,6 +242,14 @@ const esc   = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').repl
 const dirCN = (p) => (p === 1 ? '多头' : '空头');
 const stopPx = (s) => (s.pos === 1 ? s.ep * (1 - STOP) : s.ep * (1 + STOP));
 
+function triggerLine(t, s) {
+  const g = s.gap;
+  if (!g) return null;
+  if (s.pos === 1)  return `<code>${t.padEnd(5)}</code> \u591a\u5934 \u2192 \u5f00\u76d8 <b>\u2264 ${money(g.down)}</b> \u5219\u53d1\u51fa\u5e73\u4ed3\u4fe1\u53f7`;
+  if (s.pos === -1) return `<code>${t.padEnd(5)}</code> \u7a7a\u5934 \u2192 \u5f00\u76d8 <b>\u2265 ${money(g.up)}</b> \u5219\u53d1\u51fa\u5e73\u4ed3\u4fe1\u53f7`;
+  return null;
+}
+
 function actionLine(t, s) {
   if (s.pend === -99) return `⬜️ <b>${t}</b> 开盘 <b>平仓</b>（当前${dirCN(s.pos)} @ ${money(s.ep)}）`;
   if (s.pend === 1)   return `🟢 <b>${t}</b> 开盘 <b>做多</b>`;
@@ -221,15 +274,43 @@ function buildMessage(sess, et, states, quotes = {}, errs = []) {
   const held  = alive.filter((t) => states[t].pos !== 0);
   const acts  = alive.map((t) => actionLine(t, states[t])).filter(Boolean);
 
-  const head = { PRE: '\u{1F514} \u76d8\u524d', MID: '\u{1F4CA} \u76d8\u4e2d', POST: '\u{1F319} \u76d8\u540e' }[sess];
-  const L = [`<b>${head} \u00b7 ${et.date} \u7f8e\u4e1c ${et.hhmm}</b>`, ''];
+  const head = { PRE: '\u{1F514} \u76d8\u524d', MID: '\u{1F4CA} \u76d8\u4e2d',
+                 POST: '\u{1F319} \u76d8\u540e', CLOSED: '\u{1F324}\ufe0f \u4f11\u5e02' }[sess];
+  const nxt = nextTradingDay(et);
+  const nxtCN = nxt ? `${nxt.date}\uff08${WD_CN[nxt.wd]}\uff09` : '\u4e0b\u4e00\u4e2a\u4ea4\u6613\u65e5';
+  const L = [`<b>${head} \u00b7 ${et.date}${sess === 'CLOSED' ? `\uff08${WD_CN[et.wd] ?? ''}\uff09` : ` \u7f8e\u4e1c ${et.hhmm}`}</b>`, ''];
   let silent = false;
 
-  if (sess === 'PRE') {
+  // 信号读数表（盘后与休市共用）
+  const readout = () => alive.map((t) => {
+    const g = states[t].lastSig;
+    const f = (v) => (v == null ? ' \u2014  ' : v.toFixed(3));
+    const mk = (v) => (v == null ? '\u3000' : v >= HI ? '\u25b2' : v <= LO ? '\u25bc' : '\u3000');
+    return `<code>${t.padEnd(5)} \u5f71\u7ebf ${f(g.xr)}${mk(g.xr)} \u8df3\u7a7a ${f(g.yr)}${mk(g.yr)}</code>`;
+  }).join('\n');
+
+  // 触发价区块
+  const triggers = (whenCN) => {
+    const ls = held.map((t) => triggerLine(t, states[t])).filter(Boolean);
+    if (!ls.length) return [];
+    return ['', `<u>${whenCN}\u5f00\u76d8\u7684\u5e73\u4ed3\u89e6\u53d1\u4ef7</u>\u3000<i>(\u89e6\u53d1\u5219\u518d\u4e0b\u4e00\u4e2a\u5f00\u76d8\u6267\u884c)</i>`, ls.join('\n')];
+  };
+
+  if (sess === 'CLOSED') {
+    L.push(`<u>${nxtCN} \u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>\u3000<i>(\u57fa\u4e8e\u6700\u8fd1\u4e00\u4e2a\u4ea4\u6613\u65e5\u7684\u6536\u76d8 K \u7ebf)</i>`);
+    L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u5f00\u76d8\u4e0d\u52a8\u3002');
+    L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>\u3000<i>(\u6309\u6700\u65b0\u6536\u76d8\u4ef7)</i>');
+    L.push(held.length ? held.map((t) => holdLine(t, states[t], quotes[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
+    L.push(...triggers(nxtCN + ' '));
+    L.push('', '<u>\u6700\u65b0\u4fe1\u53f7\u8bfb\u6570</u>\u3000<i>(\u5206\u4f4d \u22650.80 \u6216 \u22640.20 \u624d\u89e6\u53d1)</i>');
+    L.push(readout());
+
+  } else if (sess === 'PRE') {
     L.push('<u>\u4eca\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>');
     L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u4eca\u5929\u5f00\u76d8\u4e0d\u52a8\u3002');
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
+    L.push(...triggers('\u4eca\u5929'));
 
   } else if (sess === 'MID') {
     const alerts = [];
@@ -254,14 +335,10 @@ function buildMessage(sess, et, states, quotes = {}, errs = []) {
     L.push('<u>\u660e\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>\u3000<i>(\u57fa\u4e8e\u4eca\u65e5\u6536\u76d8 K \u7ebf)</i>');
     L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u660e\u5929\u5f00\u76d8\u4e0d\u52a8\u3002');
     L.push('', '<u>\u4eca\u65e5\u4fe1\u53f7\u8bfb\u6570</u>\u3000<i>(\u5206\u4f4d \u22650.80 \u6216 \u22640.20 \u624d\u89e6\u53d1)</i>');
-    L.push(alive.map((t) => {
-      const g = states[t].lastSig;
-      const f = (v) => (v == null ? ' \u2014  ' : v.toFixed(3));
-      const mk = (v) => (v == null ? '\u3000' : v >= HI ? '\u25b2' : v <= LO ? '\u25bc' : '\u3000');
-      return `<code>${t.padEnd(5)} \u5f71\u7ebf ${f(g.xr)}${mk(g.xr)} \u8df3\u7a7a ${f(g.yr)}${mk(g.yr)}</code>`;
-    }).join('\n'));
+    L.push(readout());
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
+    L.push(...triggers('\u660e\u5929'));
     if (stale.length) L.push('', `<i>\u26a0\ufe0f ${stale.join('/')} \u7684\u4eca\u65e5K\u7ebf\u5c1a\u672a\u66f4\u65b0\uff0c\u8bfb\u6570\u53ef\u80fd\u662f\u4e0a\u4e00\u4ea4\u6613\u65e5\u7684\u3002</i>`);
   }
 
@@ -275,9 +352,10 @@ async function main() {
   const forced = process.env.FORCE_SESSION;       // PRE / MID / POST，手动触发用
   const sess = forced || session(et);
 
-  if (!forced) {
-    if (!isTradingDay(et)) { console.log(`${et.date} ${et.wd} \u4f11\u5e02\uff0c\u8df3\u8fc7`); return; }
-    if (!sess) { console.log(`\u7f8e\u4e1c ${et.hhmm} \u4e0d\u5728\u4efb\u4f55\u63d0\u9192\u65f6\u6bb5\uff0c\u8df3\u8fc7`); return; }
+  if (!forced && !sess) {
+    console.log(`\u7f8e\u4e1c ${et.date} ${et.hhmm}\uff08${isTradingDay(et) ? '\u4ea4\u6613\u65e5' : '\u4f11\u5e02'}\uff09`
+              + `\u4e0d\u5728\u4efb\u4f55\u63d0\u9192\u7a97\u53e3\uff0c\u8df3\u8fc7`);
+    return;
   }
 
   const states = {}, errs = [];
@@ -289,15 +367,22 @@ async function main() {
       const st = replay(bars, sig);
       st.last = bars[bars.length - 1];
       st.lastSig = sig[sig.length - 1];
+      st.gap = gapTrigger(bars);
       states[t] = st;
     } catch (e) { errs.push(`${t}: ${e.message}`); }
   }));
   if (!Object.keys(states).length) throw new Error(`\u5168\u90e8\u53d6\u6570\u5931\u8d25: ${errs.join('; ')}`);
 
   const quotes = {};
+  const holding = TICKERS.filter((t) => states[t] && states[t].pos !== 0);
   if (sess === 'MID') {
-    await Promise.all(TICKERS.filter((t) => states[t]?.pos !== 0 && states[t])
-      .map(async (t) => { quotes[t] = await fetchQuote(t); }));
+    await Promise.all(holding.map(async (t) => { quotes[t] = await fetchQuote(t); }));
+  } else if (sess === 'CLOSED') {
+    // 休市没有实时价，用最近一个交易日的收盘价来算浮盈亏
+    for (const t of holding) {
+      const b = states[t].last;
+      quotes[t] = { price: b.c, dayLow: b.l, dayHigh: b.h, prevClose: b.c };
+    }
   }
 
   const { text, silent } = buildMessage(sess, et, states, quotes, errs);
@@ -313,7 +398,7 @@ async function main() {
   console.log(`\u5df2\u53d1\u9001 ${sess} \u63d0\u9192\uff08${text.length} \u5b57\u7b26\uff09`);
 }
 
-export { signals, replay, pctRank, buildMessage, etParts, session, isTradingDay,
+export { signals, replay, pctRank, buildMessage, gapTrigger, etParts, session, isTradingDay,
          TICKERS, WIN, HI, LO, STOP };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
