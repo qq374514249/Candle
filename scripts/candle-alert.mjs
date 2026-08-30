@@ -288,7 +288,7 @@ async function fetchQuote(ticker) {
 const SCAN = {
   on:       (process.env.SCAN_ENABLE ?? '1') !== '0',
   detail:    Number(process.env.SCAN_DETAIL    || 3),     // 前几名给完整期权分析，其余一行带过
-  sessions: (process.env.SCAN_SESSIONS || 'PRE').split(',').map((x) => x.trim()),
+  sessions: (process.env.SCAN_SESSIONS || 'PRE,CLOSED').split(',').map((x) => x.trim()),
   top:       Number(process.env.SCAN_TOP       || 10),    // 按成交额取前几名
   minPrice:  Number(process.env.SCAN_MIN_PRICE || 10),    // 股价门槛（宽松）
   minDolVol: Number(process.env.SCAN_MIN_DOLVOL|| 0),     // 成交额门槛，0=不限
@@ -620,6 +620,20 @@ function scanBlock(scan, opts) {
   return L;
 }
 
+/** 「开盘要做的事」为空时的说明：区分「没信号」和「功能没开」 */
+function noActionNote(states, alive) {
+  const near = alive.map((t) => {
+    const g = states[t].lastSig;
+    if (g.xr == null) return null;
+    const d = Math.min(Math.abs(g.xr - HI), Math.abs(g.xr - LO));
+    return { t, xr: g.xr, d };
+  }).filter(Boolean).sort((a, b) => a.d - b.d).slice(0, 2);
+  const tip = near.length
+    ? `　最接近的：${near.map((x) => `${x.t} ${x.xr.toFixed(3)}`).join('、')}`
+    : '';
+  return `　<i>没有新开仓，所以这条里没有期权推荐。${tip}</i>`;
+}
+
 function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan = null) {
   const alive = TICKERS.filter((t) => states[t]);
   const held  = alive.filter((t) => states[t].pos !== 0);
@@ -654,7 +668,8 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
 
   if (sess === 'CLOSED') {
     L.push(`<u>${nxtCN} \u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>\u3000<i>(\u57fa\u4e8e\u6700\u8fd1\u4e00\u4e2a\u4ea4\u6613\u65e5\u7684\u6536\u76d8 K \u7ebf)</i>`);
-    L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u5f00\u76d8\u4e0d\u52a8\u3002');
+    if (acts.length) L.push(acts.join('\n'));
+    else { L.push('\u3000\u65e0 \u2014\u2014 \u5f00\u76d8\u4e0d\u52a8\u3002'); L.push(noActionNote(states, alive)); }
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>\u3000<i>(\u6309\u6700\u65b0\u6536\u76d8\u4ef7)</i>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t], quotes[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers(nxtCN + ' '));
@@ -664,7 +679,8 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
 
   } else if (sess === 'PRE') {
     L.push('<u>\u4eca\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>');
-    L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u4eca\u5929\u5f00\u76d8\u4e0d\u52a8\u3002');
+    if (acts.length) L.push(acts.join('\n'));
+    else { L.push('\u3000\u65e0 \u2014\u2014 \u4eca\u5929\u5f00\u76d8\u4e0d\u52a8\u3002'); L.push(noActionNote(states, alive)); }
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers('\u4eca\u5929'));
@@ -691,7 +707,8 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
   } else {
     const stale = alive.filter((t) => states[t].last.d !== et.date);
     L.push('<u>\u660e\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>\u3000<i>(\u57fa\u4e8e\u4eca\u65e5\u6536\u76d8 K \u7ebf)</i>');
-    L.push(acts.length ? acts.join('\n') : '\u3000\u65e0 \u2014\u2014 \u660e\u5929\u5f00\u76d8\u4e0d\u52a8\u3002');
+    if (acts.length) L.push(acts.join('\n'));
+    else { L.push('\u3000\u65e0 \u2014\u2014 \u660e\u5929\u5f00\u76d8\u4e0d\u52a8\u3002'); L.push(noActionNote(states, alive)); }
     L.push('', '<u>\u4eca\u65e5\u4fe1\u53f7\u8bfb\u6570</u>\u3000<i>(\u5206\u4f4d \u22650.80 \u6216 \u22640.20 \u624d\u89e6\u53d1)</i>');
     L.push(readout());
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
