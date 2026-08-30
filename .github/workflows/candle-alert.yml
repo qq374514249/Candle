@@ -7,13 +7,14 @@ on:
     - cron: '45 12,13 * * 1-5'   # 盘前  美东 08:45
     - cron: '30 16,17 * * 1-5'   # 盘中  美东 12:30
     - cron: '30 20,21 * * 1-5'   # 盘后  美东 16:30
+    - cron: '30 14,15 * * *'     # 休市  美东 10:30（周末与假日播报；交易日自动跳过）
   workflow_dispatch:
     inputs:
       session:
         description: '强制发送哪个时段（留空则按当前时间判断）'
         required: false
         type: choice
-        options: ['', 'PRE', 'MID', 'POST']
+        options: ['', 'PRE', 'MID', 'POST', 'CLOSED']
         default: ''
       dry_run:
         description: '只打印不发送'
