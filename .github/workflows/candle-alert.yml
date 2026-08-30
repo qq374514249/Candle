@@ -50,8 +50,8 @@ jobs:
           ALLOW_SHORT:        '1'      # 改成 '0' 则只发做多信号
           QUIET_INTRADAY:     '0'      # 改成 '1' 则盘中无异常时不发消息
           # 期权链数据源（按顺序尝试：Tradier → MarketData → Yahoo）
-          TRADIER_TOKEN:      ${{ secrets.TRADIER_TOKEN }}      # 沙盒 token，免费、不用入金
-          TRADIER_LIVE:       '0'      # 开了 Tradier 券商账户后改成 '1' 就是实时数据
+          TRADIER_TOKEN:      ${{ secrets.TRADIER_TOKEN }}      # Sandbox 或 Production 的 key 都行，脚本会自动认
+          TRADIER_LIVE:       '0'      # 只影响先试哪个环境，认不出会自动换另一个
           MARKETDATA_TOKEN:   ${{ secrets.MARKETDATA_TOKEN }}   # 可选的第二备份
           OPTIONS_PROBE:      '0'      # 改成 '1' 会在日志里打印原始返回，用来核对字段
           OPTION_ENABLE:      '1'      # 改成 '0' 则只发股票信号，不推荐期权合约
