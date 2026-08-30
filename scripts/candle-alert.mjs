@@ -162,11 +162,11 @@ async function fetchDailyYahoo(ticker, range = '2y') {
 class Fatal extends Error { constructor(m) { super(m); this.fatal = true; } }
 
 /** Twelve Data：免费 key 即可。限流按 key 计，不受 GitHub 服务器 IP 影响 */
-async function fetchDailyTD(ticker, tries = 3) {
+async function fetchDailyTD(ticker, tries = 3, out = 600) {
   if (!TD_KEY) throw new Fatal('未配置 TWELVEDATA_API_KEY');
   const SC = Number(process.env.RETRY_SCALE || 1);
   const u = `https://api.twelvedata.com/time_series?symbol=${ticker}`
-          + `&interval=1day&outputsize=600&apikey=${TD_KEY}`;
+          + `&interval=1day&outputsize=${out}&apikey=${TD_KEY}`;
   let last;
   for (let a = 0; a < tries; a++) {
     let j, status;
@@ -205,25 +205,32 @@ async function fetchDailyTD(ticker, tries = 3) {
  *             = twelvedata 强制 TD 打头
  *             = yahoo      强制 Yahoo 打头
  */
-async function fetchAll(tickers) {
+function sources() {
   const mode = (process.env.DATA_SOURCE || 'auto').toLowerCase();
   const tdFirst = mode === 'twelvedata' || (mode === 'auto' && !!TD_KEY);
   const SC = Number(process.env.RETRY_SCALE || 1);
-  const SRC = {
-    yahoo:      { name: 'Yahoo',       fn: fetchDailyYahoo, gap: 1500 * SC, warm: true },
-    twelvedata: { name: 'TwelveData',  fn: fetchDailyTD,    gap: 8000 * SC, warm: false },
+  const S = {
+    yahoo:      { name: 'Yahoo',      fn: fetchDailyYahoo, gap: 1500 * SC, warm: true,
+                  short: (t) => fetchDailyYahoo(t, '8mo') },
+    twelvedata: { name: 'TwelveData', fn: fetchDailyTD,    gap: 8000 * SC, warm: false,
+                  short: (t) => fetchDailyTD(t, 3, 180) },
   };
-  const primary = tdFirst ? SRC.twelvedata : SRC.yahoo;
-  const backup  = tdFirst ? SRC.yahoo : (TD_KEY ? SRC.twelvedata : null);
+  return { primary: tdFirst ? S.twelvedata : S.yahoo,
+           backup:  tdFirst ? S.yahoo : (TD_KEY ? S.twelvedata : null) };
+}
+
+async function fetchAll(tickers) {
+  const SC = Number(process.env.RETRY_SCALE || 1);
+  const { primary, backup } = sources();
   console.log(`主源 ${primary.name}${backup ? ` · 备源 ${backup.name}` : ' · 无备源'}`);
 
   const bars = {}, errs = {};
-  let warmed = false;
+  let warmed = false, working = null;
   const pass = async (src, list, gapMul = 1) => {
     if (src.warm && !warmed) { await warmup(); warmed = true; }
     let fatal = 0;
     for (const t of list) {
-      try { bars[t] = await src.fn(t); delete errs[t]; }
+      try { bars[t] = await src.fn(t); delete errs[t]; working = src; }
       catch (e) { errs[t] = `${src.name} ${e.message}`; if (e.fatal) fatal++; }
       await sleep(jitter(src.gap * gapMul));
     }
@@ -255,7 +262,7 @@ async function fetchAll(tickers) {
       if (got) console.log(`备源 ${backup.name} 补上 ${got} 只`);
     }
   }
-  return { bars, errs };
+  return { bars, errs, working: working ?? primary };
 }
 
 /** 盘中实时报价（用于止损监控）—— 取不到就跳过，不影响主消息 */
@@ -275,6 +282,58 @@ async function fetchQuote(ticker) {
     dayHigh: highs.length ? Math.max(...highs) : meta.regularMarketDayHigh,
     prevClose: meta.chartPreviousClose,
   };
+}
+
+// ── 扫描：从热股榜里找新机会 ──────────────────────────────────────
+const SCAN = {
+  on:       (process.env.SCAN_ENABLE ?? '1') !== '0',
+  detail:    Number(process.env.SCAN_DETAIL    || 3),     // 前几名给完整期权分析，其余一行带过
+  sessions: (process.env.SCAN_SESSIONS || 'PRE').split(',').map((x) => x.trim()),
+  top:       Number(process.env.SCAN_TOP       || 10),    // 按成交额取前几名
+  minPrice:  Number(process.env.SCAN_MIN_PRICE || 10),    // 股价门槛（宽松）
+  minDolVol: Number(process.env.SCAN_MIN_DOLVOL|| 0),     // 成交额门槛，0=不限
+  pool:      Number(process.env.SCAN_POOL      || 50),    // 从榜单前多少名里筛
+};
+// 回测里这套规则成立的区间：日成交额 ≥$2B 且 股价 ≥$50 的 10 只全部盈利，
+// 低于这个区间的 6 只全部亏损。切点是看了结果画的（n=16），只当参考不当定律。
+const SAFE = { dolVol: 2e9, price: 50 };
+
+/** Yahoo 成交最活跃榜，然后按「成交额」重排（原榜是按股数，会全是低价股） */
+async function fetchMovers() {
+  const j = await yahoo('/v1/finance/screener/predefined/saved'
+                      + `?scrIds=most_actives&count=${SCAN.pool}&formatted=false`, 2, 2000);
+  const q = j?.finance?.result?.[0]?.quotes;
+  if (!Array.isArray(q) || !q.length) throw new Error('榜单为空');
+  return q
+    .map((x) => ({ sym: x.symbol, px: x.regularMarketPrice, vol: x.regularMarketVolume,
+                   mcap: x.marketCap, chg: x.regularMarketChangePercent,
+                   dv: (x.regularMarketPrice || 0) * (x.regularMarketVolume || 0) }))
+    .filter((x) => x.sym && /^[A-Z.]{1,6}$/.test(x.sym)      // 排除期权/权证之类的怪代码
+                && x.px >= SCAN.minPrice && x.dv >= SCAN.minDolVol
+                && !TICKERS.includes(x.sym))                  // 固定名单里的已经在跟了
+    .sort((a, b) => b.dv - a.dv)
+    .slice(0, SCAN.top);
+}
+
+/** 对榜单里的每只股票算 G3 买入信号，返回今天有信号的 */
+async function scanHits(movers, fetchFn, gap) {
+  const hits = [], failed = [];
+  for (const m of movers) {
+    try {
+      const bars = await fetchFn(m.sym);
+      if (bars.length < WIN + 5) { failed.push(`${m.sym}(数据不足)`); continue; }
+      const sig = signals(bars);
+      const last = sig[sig.length - 1];
+      if (last.buy !== 0) {
+        hits.push({ ...m, dir: last.buy, xr: last.xr, bars,
+                    rv: realizedVol(bars), gap: gapTrigger(bars),
+                    lastBar: bars[bars.length - 1],
+                    safe: m.dv >= SAFE.dolVol && m.px >= SAFE.price });
+      }
+    } catch (e) { failed.push(`${m.sym}(${String(e.message).slice(0, 30)})`); }
+    await sleep(jitter(gap));
+  }
+  return { hits, failed };
 }
 
 // ── 期权：从信号选一张具体合约 ────────────────────────────────────
@@ -495,9 +554,15 @@ function holdLine(t, s, live) {
 }
 
 // ── 主流程 ───────────────────────────────────────────────────────
-function optionBlock(t, s, o) {
+function optionBlock(t, s, o, brief = false) {
   if (!o) return null;
   const c = o.c, side = o.call ? 'CALL' : 'PUT';
+  if (brief) {
+    return `　└ <b>${o.expDate.slice(5)} ${side} ${c.strike}</b>`
+         + `　$${o.cost.toFixed(0)}/张　delta ${Math.abs(c.d).toFixed(2)}`
+         + `　回本${o.call ? '涨' : '跌'} ${(Math.abs(o.be) * 100).toFixed(1)}%`
+         + `　IV ${(c.iv * 100).toFixed(0)}%`;
+  }
   const ivTxt = s.rv
     ? `IV ${(c.iv * 100).toFixed(0)}% vs 近60日实际 ${(s.rv * 100).toFixed(0)}%`
       + (c.iv > s.rv * 1.1 ? ' <b>(偏贵)</b>' : c.iv < s.rv * 0.9 ? ' (偏便宜)' : ' (合理)')
@@ -505,7 +570,8 @@ function optionBlock(t, s, o) {
   const L = [
     `　└ <b>${t} ${o.expDate} ${side} ${c.strike}</b>　${o.dte}天到期`,
     `　　买/卖 ${money(c.bid)} / ${money(c.ask)}　delta ${Math.abs(c.d).toFixed(2)}　${ivTxt}`,
-    `　　成本 <b>$${o.cost.toFixed(0)}/张</b>　预算 $${OPT.budget} → <b>${o.n} 张</b>${o.cost > OPT.budget ? ' <b>(超预算，这一张就超了)</b>' : ''}　未平仓 ${c.openInterest}`,
+    `　　成本 <b>$${o.cost.toFixed(0)}/张</b>　预算 $${OPT.budget} → <b>${o.n} 张</b>`
+      + `${o.cost > OPT.budget ? ' <b>(超预算，这一张就超了)</b>' : ''}　未平仓 ${c.openInterest}`,
     `　　回本需${o.call ? '涨' : '跌'} <b>${(Math.abs(o.be) * 100).toFixed(2)}%</b>`
       + `　<i>(回测里平均每笔只走 ${(HIST.avg * 100).toFixed(2)}%)</i>`,
     `　　<i>持有 ${HIST.holdMed} 天后，标的走多少 → 这张的盈亏：</i>`,
@@ -518,13 +584,43 @@ function optionBlock(t, s, o) {
     L.push(`　　<code>标的 ${(mv >= 0 ? '+' : '') + (mv * 100).toFixed(2)}% `
          + `${(tag.get(x.m) ?? '').padEnd(4)} → 期权 ${(p >= 0 ? '+' : '') + p.toFixed(0)}%</code>`);
   }
-  L.push(`　　<i>回测：这类合约每笔均值 ${(HIST.optAvg * 100).toFixed(0)}%、中位 ${(HIST.optMed * 100).toFixed(0)}%、`
-       + `胜率 ${(HIST.optWr * 100).toFixed(0)}%；但随机入场配同样的离场规则也有 `
-       + `${(HIST.optNoise * 100).toFixed(0)}%，差距不显著。</i>`);
   return L.join('\n');
 }
 
-function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}) {
+const OPT_FOOT = `<i>期权回测：这类合约每笔均值 ${(HIST.optAvg * 100).toFixed(0)}%、中位 `
+  + `${(HIST.optMed * 100).toFixed(0)}%、胜率 ${(HIST.optWr * 100).toFixed(0)}%；`
+  + `但随机入场配同样的离场规则也有 ${(HIST.optNoise * 100).toFixed(0)}%，差距不显著。</i>`;
+
+function scanBlock(scan, opts) {
+  if (!scan) return [];
+  const { hits, failed, n } = scan;
+  const L = ['', `<u>🔍 热股扫描</u>　<i>(成交额前 ${n} 名，固定名单以外)</i>`];
+  if (!hits.length) {
+    L.push('　无 —— 今天没扫到新机会。');
+  } else {
+    for (const [i, h] of hits.entries()) {
+      const dir = h.dir === 1 ? '🟢 <b>做多</b>' : '🔴 <b>做空</b>';
+      const zone = h.safe ? '' : '　<b>⚠️ 验证区外</b>';
+      L.push(`${dir} <b>${h.sym}</b>　$${money(h.px)}`
+           + `　成交额 $${(h.dv / 1e9).toFixed(1)}B`
+           + `　影线分位 ${h.xr.toFixed(3)}`
+           + (h.rv ? `　波动 ${(h.rv * 100).toFixed(0)}%` : '') + zone);
+      const ob = optionBlock(h.sym, h, opts[h.sym], i >= SCAN.detail);
+      if (ob) L.push(ob);
+    }
+    if (hits.some((h) => !h.safe)) {
+      L.push(`　<i>⚠️ 标记「验证区外」= 成交额 &lt;$${SAFE.dolVol / 1e9}B 或 股价 &lt;$${SAFE.price}。`
+           + `回测里这类股票 6/6 全部亏损（平均 0.91x，胜率 40.6%）。</i>`);
+    }
+  }
+  if (failed?.length) {
+    const show = failed.slice(0, 4).join(', ') + (failed.length > 4 ? ` 等 ${failed.length} 只` : '');
+    L.push(`　<i>未能检查：${esc(show)}</i>`);
+  }
+  return L;
+}
+
+function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan = null) {
   const alive = TICKERS.filter((t) => states[t]);
   const held  = alive.filter((t) => states[t].pos !== 0);
   const acts = alive.map((t) => {
@@ -564,6 +660,7 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}) {
     L.push(...triggers(nxtCN + ' '));
     L.push('', '<u>\u6700\u65b0\u4fe1\u53f7\u8bfb\u6570</u>\u3000<i>(\u5206\u4f4d \u22650.80 \u6216 \u22640.20 \u624d\u89e6\u53d1)</i>');
     L.push(readout());
+    L.push(...scanBlock(scan, opts));
 
   } else if (sess === 'PRE') {
     L.push('<u>\u4eca\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>');
@@ -571,6 +668,7 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}) {
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers('\u4eca\u5929'));
+    L.push(...scanBlock(scan, opts));
 
   } else if (sess === 'MID') {
     const alerts = [];
@@ -599,10 +697,12 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}) {
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers('\u660e\u5929'));
+    L.push(...scanBlock(scan, opts));
     if (stale.length) L.push('', `<i>\u26a0\ufe0f ${stale.join('/')} \u7684\u4eca\u65e5K\u7ebf\u5c1a\u672a\u66f4\u65b0\uff0c\u8bfb\u6570\u53ef\u80fd\u662f\u4e0a\u4e00\u4ea4\u6613\u65e5\u7684\u3002</i>`);
   }
 
   if (errs.length) L.push('', `<i>\u26a0\ufe0f \u53d6\u6570\u5931\u8d25\uff1a${esc(errs.join('; '))}</i>`);
+  if (Object.keys(opts).length) L.push('', OPT_FOOT);
   L.push('', '<i>\u5386\u53f2\u566a\u58f0\u5bf9\u7167\u663e\u793a\u8be5\u7ec4\u5408\u6709\u7ea6 15% \u6982\u7387\u662f\u968f\u673a\u4ea7\u7269\u3002\u8fd9\u662f\u76d1\u63a7\uff0c\u4e0d\u662f\u6295\u8d44\u5efa\u8bae\u3002</i>');
   return { text: L.join('\n'), silent, held, acts };
 }
@@ -618,7 +718,7 @@ async function main() {
     return;
   }
 
-  const { bars: allBars, errs: fetchErrs } = await fetchAll(TICKERS);
+  const { bars: allBars, errs: fetchErrs, working } = await fetchAll(TICKERS);
 
   const states = {}, errs = [];
   for (const t of TICKERS) {
@@ -652,36 +752,73 @@ async function main() {
     }
   }
 
-  // 只有「要开仓」的股票才去选期权；期权链只有 Yahoo 有，取不到就只发股票信号
+  // 热股扫描：从成交额榜里找固定名单以外、今天有买入信号的股票
+  let scan = null;
+  if (SCAN.on && SCAN.sessions.includes(sess)) {
+    try {
+      if (!CRUMB) await warmup();                 // 榜单接口也要 crumb
+      const movers = await fetchMovers();
+      console.log(`热股榜取到 ${movers.length} 只：${movers.map((m) => m.sym).join(' ')}`);
+      // 用刚才真正取数成功的那个源，别再用打不通的主源
+      const r = await scanHits(movers, working.short, working.gap);
+      console.log(`扫描用 ${working.name} 取数`);
+      scan = { ...r, n: movers.length };
+      console.log(`扫描命中 ${r.hits.length} 只${r.failed.length ? '，失败 ' + r.failed.join(',') : ''}`);
+    } catch (e) {
+      errs.push(`热股扫描(${e.message})`);
+    }
+  }
+
+  // 「要开仓」的股票才去选期权：固定名单里待开仓的 + 扫描命中的
   const opts = {};
-  const entering = TICKERS.filter((t) => states[t] && (states[t].pend === 1 || states[t].pend === -1));
+  const entering = [
+    ...TICKERS.filter((t) => states[t] && (states[t].pend === 1 || states[t].pend === -1))
+              .map((t) => ({ sym: t, dir: states[t].pend, px: states[t].last.c })),
+    ...(scan?.hits ?? []).map((h) => ({ sym: h.sym, dir: h.dir, px: h.lastBar.c })),
+  ];
   if (OPT.on && entering.length) {
     if (!CRUMB) await warmup();                   // 期权链强制要 crumb
-    for (const t of entering) {
+    for (const e of entering) {
       try {
-        opts[t] = await pickOption(t, states[t].pend, states[t].last.c);
-        console.log(`${t} 选中 ${opts[t].c.contractSymbol}`);
-      } catch (e) {
-        errs.push(`${t} 期权链(${e.message})`);
+        opts[e.sym] = await pickOption(e.sym, e.dir, e.px);
+        console.log(`${e.sym} 选中 ${opts[e.sym].c.contractSymbol}`);
+      } catch (err) {
+        errs.push(`${e.sym} 期权链(${err.message})`);
       }
       await sleep(jitter(1500));
     }
   }
 
-  const { text, silent } = buildMessage(sess, et, states, quotes, errs, opts);
+  const { text, silent } = buildMessage(sess, et, states, quotes, errs, opts, scan);
   if (silent && !forced) { console.log('\u76d8\u4e2d\u65e0\u5f02\u5e38\uff0c\u9759\u9ed8'); return; }
-  if (DRY_RUN || !TG_TOKEN || !TG_CHAT) { console.log(text.replace(/<[^>]+>/g, '')); return; }
+  if (DRY_RUN || !TG_TOKEN || !TG_CHAT) { console.log(text.replace(/<[^>]+>/g, '').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&')); return; }
 
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true }),
-  });
-  const jr = await r.json();
-  if (!jr.ok) { console.error('Telegram \u53d1\u9001\u5931\u8d25:', JSON.stringify(jr)); process.exit(1); }
-  console.log(`\u5df2\u53d1\u9001 ${sess} \u63d0\u9192\uff08${text.length} \u5b57\u7b26\uff09`);
+  // Telegram 单条上限 4096 字符，超了就按行拆成多条
+  const LIMIT = 3900;
+  const chunks = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    const ln = line.length > LIMIT ? line.slice(0, LIMIT - 3) + '...' : line;
+    if (cur && cur.length + ln.length + 1 > LIMIT) { chunks.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + ln;
+  }
+  if (cur) chunks.push(cur);
+
+  for (const [i, part] of chunks.entries()) {
+    const body = chunks.length > 1 ? `${part}\n\n<i>(${i + 1}/${chunks.length})</i>` : part;
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text: body, parse_mode: 'HTML',
+                             disable_web_page_preview: true }),
+    });
+    const jr = await r.json();
+    if (!jr.ok) { console.error('Telegram 发送失败:', JSON.stringify(jr)); process.exit(1); }
+    if (i < chunks.length - 1) await sleep(600);
+  }
+  console.log(`已发送 ${sess} 提醒（${text.length} 字符${chunks.length > 1 ? `，拆成 ${chunks.length} 条` : ''}）`);
 }
 
-export { signals, replay, pctRank, buildMessage, optionBlock, HIST, gapTrigger, fetchDailyTD, pickOption, bs, realizedVol, OPT, etParts, session, isTradingDay,
+export { signals, replay, pctRank, buildMessage, optionBlock, scanBlock, HIST, SAFE, gapTrigger, fetchMovers, scanHits, fetchDailyTD, pickOption, bs, realizedVol, OPT, etParts, session, isTradingDay,
          TICKERS, WIN, HI, LO, STOP };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
