@@ -392,9 +392,14 @@ const bs = (S, K, T, v, call) => {                      // Black-Scholes（无�
 
 // 期权链数据源：谁有 key 就用谁，都没配就退回 Yahoo（会被 GitHub 的 IP 限流）
 const TRADIER_TOKEN = process.env.TRADIER_TOKEN || '';
-const TRADIER_BASE  = process.env.TRADIER_BASE
-  || (process.env.TRADIER_LIVE === '1' ? 'https://api.tradier.com'
-                                       : 'https://sandbox.tradier.com');
+// Tradier 有两套环境，两边的 key 不通用：
+//   sandbox.tradier.com  ← Sandbox API Access 那把 key，延迟 15 分钟
+//   api.tradier.com      ← Production API Access 那把 key，实时（需券商账户）
+// 不写死用哪个：两个都试，哪个认这把 key 就记住哪个，省得填错环境白报 401。
+const TRADIER_HOSTS = process.env.TRADIER_BASE ? [process.env.TRADIER_BASE]
+  : process.env.TRADIER_LIVE === '1' ? ['https://api.tradier.com', 'https://sandbox.tradier.com']
+  : ['https://sandbox.tradier.com', 'https://api.tradier.com'];
+let TRADIER_OK = null;                 // 记住这次跑通的那个 host
 const MD_TOKEN = process.env.MARKETDATA_TOKEN || '';
 const PROBE = process.env.OPTIONS_PROBE === '1';   // 打印原始返回，用来核对字段名
 
@@ -411,11 +416,24 @@ function pickExpiry(cands) {
 /** Tradier：沙盒延迟15分钟（免费、不用入金）；开了券商账户把 TRADIER_LIVE 设成 1 就是实时 */
 async function chainTradier(ticker, call, spot) {
   const H = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: 'application/json' };
+  /** 第一次请求时把两个环境都试一遍，认出这把 key 属于哪边 */
   const get = async (path) => {
-    const r = await fetch(`${TRADIER_BASE}${path}`, { headers: H });
-    if (r.status === 401 || r.status === 403) throw new Fatal(`token 无效(${r.status})`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
+    const hosts = TRADIER_OK ? [TRADIER_OK] : TRADIER_HOSTS;
+    let auth = null;
+    for (const host of hosts) {
+      const r = await fetch(`${host}${path}`, { headers: H });
+      if (r.status === 401 || r.status === 403) {
+        auth = `${host.includes('sandbox') ? '沙盒' : '实盘'}环境不认这把 key(${r.status})`;
+        continue;                                   // 换另一个环境再试
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!TRADIER_OK) {
+        TRADIER_OK = host;
+        console.log(`Tradier 用 ${host.includes('sandbox') ? '沙盒(延迟15分钟)' : '实盘(实时)'} 环境`);
+      }
+      return r.json();
+    }
+    throw new Fatal(auth ?? 'token 无效');
   };
   const e = await get(`/v1/markets/options/expirations?symbol=${ticker}&includeAllRoots=true`);
   const dates = e?.expirations?.date
@@ -500,7 +518,9 @@ async function chainYahoo(ticker, call, spot) {
 
 function optionProviders() {
   const list = [];
-  if (TRADIER_TOKEN) list.push({ name: `Tradier${TRADIER_BASE.includes('sandbox') ? '沙盒' : ''}`, fn: chainTradier });
+  if (TRADIER_TOKEN) list.push({
+    get name() { return `Tradier${TRADIER_OK ? (TRADIER_OK.includes('sandbox') ? '沙盒' : '实盘') : ''}`; },
+    fn: chainTradier });
   if (MD_TOKEN)      list.push({ name: 'MarketData', fn: chainMarketData });
   list.push({ name: 'Yahoo', fn: chainYahoo });
   return list;
@@ -855,7 +875,21 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
     if (stale.length) L.push('', `<i>\u26a0\ufe0f ${stale.join('/')} \u7684\u4eca\u65e5K\u7ebf\u5c1a\u672a\u66f4\u65b0\uff0c\u8bfb\u6570\u53ef\u80fd\u662f\u4e0a\u4e00\u4ea4\u6613\u65e5\u7684\u3002</i>`);
   }
 
-  if (errs.length) L.push('', `<i>\u26a0\ufe0f \u53d6\u6570\u5931\u8d25\uff1a${esc(errs.join('; '))}</i>`);
+  if (errs.length) {
+    // 同一个原因的合并成一行：「7 只期权链失败(原因)」而不是把同一句重复 7 遍
+    const groups = new Map();
+    for (const e of errs) {
+      const m = e.match(/^([A-Z.]{1,6})\s*(.*?)\((.*)\)$/s);
+      const key = m ? `${m[2]}(${m[3]})` : e;
+      if (!groups.has(key)) groups.set(key, []);
+      if (m) groups.get(key).push(m[1]);
+    }
+    L.push('', '<i>⚠️ 取数失败</i>');
+    for (const [reason, who] of groups) {
+      L.push(who.length > 2 ? `　<i>${esc(who.length + ' 只' + reason)}</i>　<code>${esc(who.join(' '))}</code>`
+                            : `　<i>${esc((who.length ? who.join('/') + ' ' : '') + reason)}</i>`);
+    }
+  }
   if (Object.keys(opts).length) L.push('', OPT_FOOT);
   L.push('', '<i>\u5386\u53f2\u566a\u58f0\u5bf9\u7167\u663e\u793a\u8be5\u7ec4\u5408\u6709\u7ea6 15% \u6982\u7387\u662f\u968f\u673a\u4ea7\u7269\u3002\u8fd9\u662f\u76d1\u63a7\uff0c\u4e0d\u662f\u6295\u8d44\u5efa\u8bae\u3002</i>');
   return { text: L.join('\n'), silent, held, acts };
