@@ -92,7 +92,7 @@ const jitter = (ms) => ms * (0.7 + Math.random() * 0.6);
 
 let COOKIE = '';
 let CRUMB = '';
-/** 先拿 Yahoo 的 cookie + crumb —— 期权链接口强制要 crumb，行情接口也更不容易被限流 */
+/** 先拿 Yahoo 的 cookie + crumb —— 榜单接口强制要 crumb，行情接口也更不容易被限流 */
 async function warmup() {
   try {
     const r = await fetch('https://fc.yahoo.com', { headers: { 'User-Agent': UA } });
@@ -287,7 +287,6 @@ async function fetchQuote(ticker) {
 // ── 扫描：从热股榜里找新机会 ──────────────────────────────────────
 const SCAN = {
   on:       (process.env.SCAN_ENABLE ?? '1') !== '0',
-  detail:    Number(process.env.SCAN_DETAIL    || 3),     // 前几名给完整期权分析，其余一行带过
   sessions: (process.env.SCAN_SESSIONS || 'PRE,CLOSED').split(',').map((x) => x.trim()),
   top:       Number(process.env.SCAN_TOP       || 10),    // 按成交额取前几名
   minPrice:  Number(process.env.SCAN_MIN_PRICE || 10),    // 股价门槛（宽松）
@@ -340,7 +339,7 @@ async function scanHits(movers, fetchFn, gap) {
       const last = sig[sig.length - 1];
       const lastBar = bars[bars.length - 1];
       // 榜单给了成交额就用榜单的；备用名单没有，就用日线自己算
-      const px = m.px ?? lastBar.c;
+      const px = lastBar.c;              // 跟信号、入场估算用同一个价，避免两处数字打架
       const dv = m.dv ?? avgDollarVol(bars);
       if (last.buy !== 0) {
         hits.push({ sym: m.sym, px, dv, dir: last.buy, xr: last.xr, bars,
@@ -354,217 +353,13 @@ async function scanHits(movers, fetchFn, gap) {
   return { hits, failed };
 }
 
-// ── 期权：从信号选一张具体合约 ────────────────────────────────────
-const OPT = {
-  on:        (process.env.OPTION_ENABLE ?? '1') !== '0',
-  dteMin:    Number(process.env.OPTION_DTE_MIN    || 7),
-  dteMax:    Number(process.env.OPTION_DTE_MAX    || 14),
-  dteWant:   Number(process.env.OPTION_DTE_TARGET || 11),
-  delta:     Number(process.env.OPTION_DELTA      || 0.55),   // 目标 delta，0.5≈平值
-  minOI:     Number(process.env.OPTION_MIN_OI     || 200),
-  maxSpread: Number(process.env.OPTION_MAX_SPREAD || 0.15),   // (卖价-买价)/中间价
-  budget:    Number(process.env.OPTION_BUDGET     || 500),    // 每笔想投多少美元
-};
-
-// 回测里 475 笔交易的标的表现，用来和期权的回本门槛做对比
+// ── 回测参考数字（用来在入场提示里给出历史预期）──────────────────
+// 来自 2024-08~2026-08、8 只科技股、G3→G8 组合的 475 笔交易
 const HIST = {
-  avg: 0.0086, med: 0.0008, win: 0.0498, loss: -0.0347, wr: 0.512,   // 标的每笔表现
-  holdMed: 3, holdP90: 11,                                            // 持仓交易日
-  // 把这 475 笔换成 11 天期 delta≈0.55 期权的回测结果（IV 按实际波动×1.15）
-  optAvg: 0.152, optMed: -0.175, optWr: 0.398, optNoise: 0.074,
+  avg: 0.0086, med: 0.0008, win: 0.0498, loss: -0.0347, wr: 0.512,
+  holdMed: 3, holdP90: 11,          // 持仓交易日：中位 3，90% 在 11 天内结束
 };
 
-const ncdf = (x) => {                                   // 标准正态累积分布
-  const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989423 * Math.exp(-x * x / 2);
-  const p = d * t * (1.330274429 * t ** 4 - 1.821255978 * t ** 3
-                   + 1.781477937 * t * t - 0.356563782 * t + 0.319381530);
-  return x > 0 ? 1 - p : p;
-};
-const bs = (S, K, T, v, call) => {                      // Black-Scholes（无风险利率按 4%）
-  if (T <= 0) return { px: Math.max(0, call ? S - K : K - S), delta: call ? (S > K ? 1 : 0) : (S < K ? -1 : 0) };
-  const r = 0.04, sq = v * Math.sqrt(T);
-  const d1 = (Math.log(S / K) + (r + v * v / 2) * T) / sq, d2 = d1 - sq;
-  const px = call ? S * ncdf(d1) - K * Math.exp(-r * T) * ncdf(d2)
-                  : K * Math.exp(-r * T) * ncdf(-d2) - S * ncdf(-d1);
-  return { px, delta: call ? ncdf(d1) : ncdf(d1) - 1 };
-};
-
-// 期权链数据源：谁有 key 就用谁，都没配就退回 Yahoo（会被 GitHub 的 IP 限流）
-const TRADIER_TOKEN = process.env.TRADIER_TOKEN || '';
-// Tradier 有两套环境，两边的 key 不通用：
-//   sandbox.tradier.com  ← Sandbox API Access 那把 key，延迟 15 分钟
-//   api.tradier.com      ← Production API Access 那把 key，实时（需券商账户）
-// 不写死用哪个：两个都试，哪个认这把 key 就记住哪个，省得填错环境白报 401。
-const TRADIER_HOSTS = process.env.TRADIER_BASE ? [process.env.TRADIER_BASE]
-  : process.env.TRADIER_LIVE === '1' ? ['https://api.tradier.com', 'https://sandbox.tradier.com']
-  : ['https://sandbox.tradier.com', 'https://api.tradier.com'];
-let TRADIER_OK = null;                 // 记住这次跑通的那个 host
-const MD_TOKEN = process.env.MARKETDATA_TOKEN || '';
-const PROBE = process.env.OPTIONS_PROBE === '1';   // 打印原始返回，用来核对字段名
-
-const num = (v) => { const x = Number(v); return isFinite(x) ? x : null; };
-const dteOf = (iso) => Math.round((Date.parse(`${iso}T20:00:00Z`) - Date.now()) / 86400000);
-
-/** 从到期日列表里挑最接近目标 DTE 的那个 */
-function pickExpiry(cands) {
-  const ok = cands.filter((c) => c.dte >= OPT.dteMin && c.dte <= OPT.dteMax);
-  if (!ok.length) throw new Error(`${OPT.dteMin}~${OPT.dteMax}天内无到期日`);
-  return ok.sort((x, y) => Math.abs(x.dte - OPT.dteWant) - Math.abs(y.dte - OPT.dteWant))[0];
-}
-
-/** Tradier：沙盒延迟15分钟（免费、不用入金）；开了券商账户把 TRADIER_LIVE 设成 1 就是实时 */
-async function chainTradier(ticker, call, spot) {
-  const H = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: 'application/json' };
-  /** 第一次请求时把两个环境都试一遍，认出这把 key 属于哪边 */
-  const get = async (path) => {
-    const hosts = TRADIER_OK ? [TRADIER_OK] : TRADIER_HOSTS;
-    let auth = null;
-    for (const host of hosts) {
-      const r = await fetch(`${host}${path}`, { headers: H });
-      if (r.status === 401 || r.status === 403) {
-        auth = `${host.includes('sandbox') ? '沙盒' : '实盘'}环境不认这把 key(${r.status})`;
-        continue;                                   // 换另一个环境再试
-      }
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      if (!TRADIER_OK) {
-        TRADIER_OK = host;
-        console.log(`Tradier 用 ${host.includes('sandbox') ? '沙盒(延迟15分钟)' : '实盘(实时)'} 环境`);
-      }
-      return r.json();
-    }
-    throw new Fatal(auth ?? 'token 无效');
-  };
-  const e = await get(`/v1/markets/options/expirations?symbol=${ticker}&includeAllRoots=true`);
-  const dates = e?.expirations?.date
-    ?? (e?.expirations?.expiration ?? []).map((x) => x.date);
-  if (!dates?.length) throw new Error('无到期日');
-  const exp = pickExpiry(dates.map((d) => ({ d, dte: dteOf(d) })));
-
-  let S = spot;
-  try {                                          // 标的报价：链里没有，单独取一次
-    const q = await get(`/v1/markets/quotes?symbols=${ticker}`);
-    let qq = q?.quotes?.quote;
-    if (Array.isArray(qq)) qq = qq[0];
-    S = num(qq?.last) ?? num(qq?.close) ?? num(qq?.prevclose) ?? spot;
-  } catch { /* 取不到就用日线收盘价 */ }
-
-  const c = await get(`/v1/markets/options/chains?symbol=${ticker}&expiration=${exp.d}&greeks=true`);
-  let raw = c?.options?.option;
-  if (!raw) throw new Error('链为空');
-  if (!Array.isArray(raw)) raw = [raw];
-  if (PROBE) console.log('[probe tradier]', JSON.stringify(raw[0]).slice(0, 800));
-  const rows = raw
-    .filter((x) => (x.option_type ?? x.type) === (call ? 'call' : 'put'))
-    .map((x) => ({
-      contractSymbol: x.symbol, strike: num(x.strike),
-      bid: num(x.bid), ask: num(x.ask),
-      openInterest: num(x.open_interest) ?? 0, volume: num(x.volume) ?? 0,
-      iv: num(x.greeks?.mid_iv) ?? num(x.greeks?.smv_vol),
-      d: num(x.greeks?.delta),
-    }));
-  if (!rows.length) throw new Error('该到期日无对应方向合约');
-  return { rows, exp, S };
-}
-
-/** MarketData.app：一次请求拿到指定 DTE 的整条链，返回是列式数组 */
-async function chainMarketData(ticker, call, spot) {
-  const u = `https://api.marketdata.app/v1/options/chain/${ticker}/`
-          + `?dte=${OPT.dteWant}&side=${call ? 'call' : 'put'}&token=${MD_TOKEN}`;
-  const r = await fetch(u, { headers: { Accept: 'application/json' } });
-  const j = await r.json().catch(() => null);
-  if (r.status === 401 || r.status === 403) throw new Fatal(`token 无效(${r.status})`);
-  if (j?.s !== 'ok' || !j.optionSymbol?.length)
-    throw new Error(`${r.status}: ${String(j?.errmsg ?? '').slice(0, 50)}`);
-  if (PROBE) console.log('[probe marketdata]', JSON.stringify(Object.fromEntries(
-    Object.keys(j).filter((k) => Array.isArray(j[k])).map((k) => [k, j[k][0]]))).slice(0, 800));
-  const rows = j.optionSymbol.map((sym, i) => ({
-    contractSymbol: sym, strike: num(j.strike[i]),
-    bid: num(j.bid[i]), ask: num(j.ask[i]),
-    openInterest: num(j.openInterest?.[i]) ?? 0, volume: num(j.volume?.[i]) ?? 0,
-    iv: num(j.iv?.[i]), d: num(j.delta?.[i]),
-  }));
-  return { rows,
-           exp: { d: new Date(j.expiration[0] * 1000).toISOString().slice(0, 10), dte: j.dte[0] },
-           S: num(j.underlyingPrice?.[0]) ?? spot };
-}
-
-/** Yahoo：没有 greeks，delta 用 Black-Scholes 自己算 */
-async function chainYahoo(ticker, call, spot) {
-  const a = await yahoo(`/v7/finance/options/${ticker}`, 2, 2000);
-  const r0 = a?.optionChain?.result?.[0];
-  if (!r0?.expirationDates?.length) throw new Error('拿不到到期日列表');
-  const now = Date.now() / 1000;
-  const exp = pickExpiry(r0.expirationDates.map((e) => ({
-    d: new Date(e * 1000).toISOString().slice(0, 10),
-    dte: Math.round((e - now) / 86400), e })));
-
-  await sleep(jitter(1200));
-  const b = await yahoo(`/v7/finance/options/${ticker}?date=${exp.e}`, 2, 2000);
-  const r = b?.optionChain?.result?.[0];
-  const leg = r?.options?.[0]?.[call ? 'calls' : 'puts'] ?? [];
-  const S = num(r?.quote?.regularMarketPrice) ?? spot;
-  if (!leg.length || !S) throw new Error('期权链为空');
-  const T = exp.dte / 365;
-  const rows = leg.map((c) => ({
-    contractSymbol: c.contractSymbol, strike: num(c.strike),
-    bid: num(c.bid), ask: num(c.ask),
-    openInterest: num(c.openInterest) ?? 0, volume: num(c.volume) ?? 0,
-    iv: num(c.impliedVolatility),
-    d: c.impliedVolatility > 0 ? bs(S, c.strike, T, c.impliedVolatility, call).delta : null,
-  }));
-  return { rows, exp, S };
-}
-
-function optionProviders() {
-  const list = [];
-  if (TRADIER_TOKEN) list.push({
-    get name() { return `Tradier${TRADIER_OK ? (TRADIER_OK.includes('sandbox') ? '沙盒' : '实盘') : ''}`; },
-    fn: chainTradier });
-  if (MD_TOKEN)      list.push({ name: 'MarketData', fn: chainMarketData });
-  list.push({ name: 'Yahoo', fn: chainYahoo });
-  return list;
-}
-
-/** 挑一张合约：按目标 delta + 流动性筛选；数据源依次尝试，前面的挂了自动用下一个 */
-async function pickOption(ticker, dir, spotHint) {
-  const call = dir === 1;
-  const errs = [];
-  for (const p of optionProviders()) {
-    let chain;
-    try { chain = await p.fn(ticker, call, spotHint); }
-    catch (e) { errs.push(`${p.name}:${e.message}`); continue; }
-
-    const T = Math.max(chain.exp.dte, 0) / 365;
-    const S = chain.S;
-    const rows = chain.rows.map((c) => {
-      const mid = (c.bid + c.ask) / 2;
-      const d = c.d ?? (c.iv > 0 && S ? bs(S, c.strike, T, c.iv, call).delta : NaN);
-      return { ...c, mid, d, spread: mid > 0 ? (c.ask - c.bid) / mid : 9 };
-    }).filter((c) => c.bid > 0 && c.ask > 0 && isFinite(c.d) && c.strike > 0
-                  && c.openInterest >= OPT.minOI && c.spread <= OPT.maxSpread);
-    if (!rows.length) { errs.push(`${p.name}:无满足流动性的合约`); continue; }
-    // 标的价必须落在行权价区间内，否则是标的价和链对不上（换过股、取错代码、报价源串了）
-    const ks = rows.map((c) => c.strike);
-    if (!S || S < Math.min(...ks) * 0.6 || S > Math.max(...ks) * 1.4) {
-      errs.push(`${p.name}:标的价 ${money(S)} 与行权价区间 ${money(Math.min(...ks))}~${money(Math.max(...ks))} 不匹配`);
-      continue;
-    }
-
-    const best = rows.sort((x, y) => Math.abs(Math.abs(x.d) - OPT.delta)
-                                   - Math.abs(Math.abs(y.d) - OPT.delta))[0];
-    const cost = best.ask * 100;
-    const n = Math.max(1, Math.floor(OPT.budget / cost));
-    const be = call ? (best.strike + best.ask) / S - 1 : 1 - (best.strike - best.ask) / S;
-    const iv = best.iv > 0 ? best.iv : 0.4;
-    const Th = Math.max(0, chain.exp.dte - 4) / 365;
-    const scen = [HIST.win, HIST.avg, 0, HIST.loss, -0.08].map((m) => ({
-      m, opt: bs(S * (1 + (call ? m : -m)), best.strike, Th, iv, call).px / best.ask - 1 }));
-    return { dte: chain.exp.dte, S, c: { ...best, iv }, cost, n, be, scen, call,
-             expDate: chain.exp.d, src: p.name };
-  }
-  throw new Error(errs.join(' / ') || '无可用期权数据源');
-}
 
 // ── 指标 ─────────────────────────────────────────────────────────
 /** 最近 WIN 根里，有多少比例的历史值严格小于当前值（与回测的 rolling.apply 一致） */
@@ -628,7 +423,7 @@ function gapTrigger(bars) {
 }
 
 // ── 重放持仓状态（与 Python 回测 run() 逐行等价）──────────────────
-/** 近 n 日年化实际波动率，用来判断期权贵不贵 */
+/** 近 n 日年化实际波动率，扫描结果里用来看这只股票有多躁 */
 function realizedVol(bars, n = 60) {
   const r = [];
   for (let i = Math.max(1, bars.length - n); i < bars.length; i++)
@@ -709,44 +504,37 @@ function holdLine(t, s, live) {
 }
 
 // ── 主流程 ───────────────────────────────────────────────────────
-function optionBlock(t, s, o, brief = false) {
-  if (!o) return null;
-  const c = o.c, side = o.call ? 'CALL' : 'PUT';
-  if (brief) {
-    return `　└ <b>${o.expDate.slice(5)} ${side} ${c.strike}</b>`
-         + `　$${o.cost.toFixed(0)}/张　delta ${Math.abs(c.d).toFixed(2)}`
-         + `　回本${o.call ? '涨' : '跌'} ${(Math.abs(o.be) * 100).toFixed(1)}%`
-         + `　IV ${(c.iv * 100).toFixed(0)}%`;
-  }
-  const ivTxt = s.rv
-    ? `IV ${(c.iv * 100).toFixed(0)}% vs 近60日实际 ${(s.rv * 100).toFixed(0)}%`
-      + (c.iv > s.rv * 1.1 ? ' <b>(偏贵)</b>' : c.iv < s.rv * 0.9 ? ' (偏便宜)' : ' (合理)')
-    : `IV ${(c.iv * 100).toFixed(0)}%`;
+/**
+ * 入场信号附带的「离场位置」。这套策略没有固定止盈——离场由 G8 跳空信号决定，
+ * 所以能给出的确定数字是两个：8% 止损价，和会触发平仓信号的开盘价。
+ *
+ * 时点关系：今天收盘发出开仓信号 → 明天开盘建仓；G8 用「明天开盘 vs 今天收盘」判断，
+ * 所以下面那个触发价说的就是明天开盘那一下，触发则后天开盘平仓。
+ */
+const HIST_FOOT = `<i>历史参考：中位持有 ${HIST.holdMed} 个交易日（90% 在 ${HIST.holdP90} 天内结束）；`
+  + `赢单均值 ${(HIST.win * 100).toFixed(2)}%，输单均值 ${(HIST.loss * 100).toFixed(2)}%，`
+  + `胜率 ${(HIST.wr * 100).toFixed(1)}%。没有固定止盈 —— 离场由跳空信号决定。</i>`;
+
+function entryPlan(t, s, dir) {
+  const ref = s.lastBar?.c ?? s.last?.c;            // 用最近收盘价估算，实际以开盘价为准
+  if (!ref) return null;
+  const long = dir === 1;
+  const stop = ref * (long ? 1 - STOP : 1 + STOP);
   const L = [
-    `　└ <b>${t} ${o.expDate} ${side} ${c.strike}</b>　${o.dte}天到期　<i>${o.src}</i>`,
-    `　　买/卖 ${money(c.bid)} / ${money(c.ask)}　delta ${Math.abs(c.d).toFixed(2)}　${ivTxt}`,
-    `　　成本 <b>$${o.cost.toFixed(0)}/张</b>　预算 $${OPT.budget} → <b>${o.n} 张</b>`
-      + `${o.cost > OPT.budget ? ' <b>(超预算，这一张就超了)</b>' : ''}　未平仓 ${c.openInterest}`,
-    `　　回本需${o.call ? '涨' : '跌'} <b>${(Math.abs(o.be) * 100).toFixed(2)}%</b>`
-      + `　<i>(回测里平均每笔只走 ${(HIST.avg * 100).toFixed(2)}%)</i>`,
-    `　　<i>持有 ${HIST.holdMed} 天后，标的走多少 → 这张的盈亏：</i>`,
+    `　　入场 ≈ <b>${money(ref)}</b>　<i>(按最近收盘价估算，实际以开盘价为准)</i>`,
+    `　　止损 <b>${money(stop)}</b>　<i>(${long ? '跌破' : '涨破'}即离场，盘中触及就走)</i>`,
   ];
-  const tag = new Map([[HIST.win, '赢单均值'], [HIST.avg, '全部均值'], [0, '不动'],
-                       [HIST.loss, '输单均值'], [-0.08, '打止损']]);
-  for (const x of o.scen) {
-    const mv = o.call ? x.m : -x.m;                    // 显示标的真实涨跌方向
-    const p = x.opt * 100;
-    L.push(`　　<code>标的 ${(mv >= 0 ? '+' : '') + (mv * 100).toFixed(2)}% `
-         + `${(tag.get(x.m) ?? '').padEnd(4)} → 期权 ${(p >= 0 ? '+' : '') + p.toFixed(0)}%</code>`);
+  const g = s.gap;
+  if (g) {
+    const lvl = long ? g.down : g.up;
+    L.push(`　　离场信号　开盘 ${long ? '≤' : '≥'} <b>${money(lvl)}</b> 则发出平仓信号`
+         + `　<i>(再下一个开盘执行)</i>`);
   }
   return L.join('\n');
 }
 
-const OPT_FOOT = `<i>期权回测：这类合约每笔均值 ${(HIST.optAvg * 100).toFixed(0)}%、中位 `
-  + `${(HIST.optMed * 100).toFixed(0)}%、胜率 ${(HIST.optWr * 100).toFixed(0)}%；`
-  + `但随机入场配同样的离场规则也有 ${(HIST.optNoise * 100).toFixed(0)}%，差距不显著。</i>`;
 
-function scanBlock(scan, opts) {
+function scanBlock(scan) {
   if (!scan) return [];
   const { hits, failed, n } = scan;
   const L = ['', scan.src === '备用名单'
@@ -755,15 +543,15 @@ function scanBlock(scan, opts) {
   if (!hits.length) {
     L.push('　无 —— 今天没扫到新机会。');
   } else {
-    for (const [i, h] of hits.entries()) {
+    for (const h of hits) {
       const dir = h.dir === 1 ? '🟢 <b>做多</b>' : '🔴 <b>做空</b>';
       const zone = h.safe ? '' : '　<b>⚠️ 验证区外</b>';
       L.push(`${dir} <b>${h.sym}</b>　$${money(h.px)}`
            + `　成交额 $${(h.dv / 1e9).toFixed(1)}B`
            + `　影线分位 ${h.xr.toFixed(3)}`
            + (h.rv ? `　波动 ${(h.rv * 100).toFixed(0)}%` : '') + zone);
-      const ob = optionBlock(h.sym, h, opts[h.sym], i >= SCAN.detail);
-      if (ob) L.push(ob);
+      const ep = entryPlan(h.sym, h, h.dir);
+      if (ep) L.push(ep);
     }
     if (hits.some((h) => !h.safe)) {
       L.push(`　<i>⚠️ 标记「验证区外」= 成交额 &lt;$${SAFE.dolVol / 1e9}B 或 股价 &lt;$${SAFE.price}。`
@@ -788,17 +576,20 @@ function noActionNote(states, alive) {
   const tip = near.length
     ? `　最接近的：${near.map((x) => `${x.t} ${x.xr.toFixed(3)}`).join('、')}`
     : '';
-  return `　<i>没有新开仓，所以这条里没有期权推荐。${tip}</i>`;
+  return `　<i>没有触发新的开仓信号。${tip}</i>`;
 }
 
-function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan = null) {
+function buildMessage(sess, et, states, quotes = {}, errs = [], scan = null) {
   const alive = TICKERS.filter((t) => states[t]);
   const held  = alive.filter((t) => states[t].pos !== 0);
+  const hasEntry = alive.some((t) => states[t].pend === 1 || states[t].pend === -1)
+                || (scan?.hits?.length > 0);
   const acts = alive.map((t) => {
     const line = actionLine(t, states[t]);
     if (!line) return null;
-    const ob = states[t].pend === 1 || states[t].pend === -1 ? optionBlock(t, states[t], opts[t]) : null;
-    return ob ? `${line}\n${ob}` : line;
+    const ep = states[t].pend === 1 || states[t].pend === -1
+      ? entryPlan(t, states[t], states[t].pend) : null;
+    return ep ? `${line}\n${ep}` : line;
   }).filter(Boolean);
 
   const head = { PRE: '\u{1F514} \u76d8\u524d', MID: '\u{1F4CA} \u76d8\u4e2d',
@@ -832,7 +623,7 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
     L.push(...triggers(nxtCN + ' '));
     L.push('', '<u>\u6700\u65b0\u4fe1\u53f7\u8bfb\u6570</u>\u3000<i>(\u5206\u4f4d \u22650.80 \u6216 \u22640.20 \u624d\u89e6\u53d1)</i>');
     L.push(readout());
-    L.push(...scanBlock(scan, opts));
+    L.push(...scanBlock(scan));
 
   } else if (sess === 'PRE') {
     L.push('<u>\u4eca\u5929\u5f00\u76d8\u8981\u505a\u7684\u4e8b</u>');
@@ -841,7 +632,7 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers('\u4eca\u5929'));
-    L.push(...scanBlock(scan, opts));
+    L.push(...scanBlock(scan));
 
   } else if (sess === 'MID') {
     const alerts = [];
@@ -871,12 +662,13 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
     L.push('', '<u>\u5f53\u524d\u6301\u4ed3</u>');
     L.push(held.length ? held.map((t) => holdLine(t, states[t])).join('\n') : '\u3000\u5168\u90e8\u7a7a\u4ed3\u3002');
     L.push(...triggers('\u660e\u5929'));
-    L.push(...scanBlock(scan, opts));
+    L.push(...scanBlock(scan));
     if (stale.length) L.push('', `<i>\u26a0\ufe0f ${stale.join('/')} \u7684\u4eca\u65e5K\u7ebf\u5c1a\u672a\u66f4\u65b0\uff0c\u8bfb\u6570\u53ef\u80fd\u662f\u4e0a\u4e00\u4ea4\u6613\u65e5\u7684\u3002</i>`);
   }
 
+  if (hasEntry) L.push('', HIST_FOOT);
   if (errs.length) {
-    // 同一个原因的合并成一行：「7 只期权链失败(原因)」而不是把同一句重复 7 遍
+    // 同一个原因的合并成一行，别把同一句话重复很多遍
     const groups = new Map();
     for (const e of errs) {
       const m = e.match(/^([A-Z.]{1,6})\s*(.*?)\((.*)\)$/s);
@@ -890,7 +682,6 @@ function buildMessage(sess, et, states, quotes = {}, errs = [], opts = {}, scan 
                             : `　<i>${esc((who.length ? who.join('/') + ' ' : '') + reason)}</i>`);
     }
   }
-  if (Object.keys(opts).length) L.push('', OPT_FOOT);
   L.push('', '<i>\u5386\u53f2\u566a\u58f0\u5bf9\u7167\u663e\u793a\u8be5\u7ec4\u5408\u6709\u7ea6 15% \u6982\u7387\u662f\u968f\u673a\u4ea7\u7269\u3002\u8fd9\u662f\u76d1\u63a7\uff0c\u4e0d\u662f\u6295\u8d44\u5efa\u8bae\u3002</i>');
   return { text: L.join('\n'), silent, held, acts };
 }
@@ -965,27 +756,7 @@ async function main() {
     }
   }
 
-  // 「要开仓」的股票才去选期权：固定名单里待开仓的 + 扫描命中的
-  const opts = {};
-  const entering = [
-    ...TICKERS.filter((t) => states[t] && (states[t].pend === 1 || states[t].pend === -1))
-              .map((t) => ({ sym: t, dir: states[t].pend, px: states[t].last.c })),
-    ...(scan?.hits ?? []).map((h) => ({ sym: h.sym, dir: h.dir, px: h.lastBar.c })),
-  ];
-  if (OPT.on && entering.length) {
-    if (!CRUMB) await warmup();                   // 期权链强制要 crumb
-    for (const e of entering) {
-      try {
-        opts[e.sym] = await pickOption(e.sym, e.dir, e.px);
-        console.log(`${e.sym} 选中 ${opts[e.sym].c.contractSymbol}`);
-      } catch (err) {
-        errs.push(`${e.sym} 期权链(${err.message})`);
-      }
-      await sleep(jitter(1500));
-    }
-  }
-
-  const { text, silent } = buildMessage(sess, et, states, quotes, errs, opts, scan);
+  const { text, silent } = buildMessage(sess, et, states, quotes, errs, scan);
   if (silent && !forced) { console.log('\u76d8\u4e2d\u65e0\u5f02\u5e38\uff0c\u9759\u9ed8'); return; }
   if (DRY_RUN || !TG_TOKEN || !TG_CHAT) { console.log(text.replace(/<[^>]+>/g, '').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&')); return; }
 
@@ -1014,7 +785,7 @@ async function main() {
   console.log(`已发送 ${sess} 提醒（${text.length} 字符${chunks.length > 1 ? `，拆成 ${chunks.length} 条` : ''}）`);
 }
 
-export { signals, replay, pctRank, buildMessage, optionBlock, scanBlock, HIST, SAFE, gapTrigger, fetchMovers, scanHits, fetchDailyTD, pickOption, bs, realizedVol, OPT, etParts, session, isTradingDay,
+export { signals, replay, pctRank, buildMessage, entryPlan, scanBlock, HIST, SAFE, gapTrigger, fetchMovers, scanHits, fetchDailyTD, realizedVol, etParts, session, isTradingDay,
          TICKERS, WIN, HI, LO, STOP };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
