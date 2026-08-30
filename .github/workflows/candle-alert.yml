@@ -50,4 +50,8 @@ jobs:
           OPTION_ENABLE:      '1'      # 改成 '0' 则只发股票信号，不推荐期权合约
           OPTION_BUDGET:      '500'    # 每笔期权想投入多少美元
           OPTION_DELTA:       '0.55'   # 目标 delta：0.5≈平值，0.7≈实值更像正股
+          SCAN_ENABLE:        '1'      # 盘前扫描热股榜找新机会；'0' 关闭
+          SCAN_TOP:           '10'     # 按成交额取前几名
+          SCAN_MIN_PRICE:     '10'     # 股价门槛。想只留验证过的那类股票就改成 50
+          SCAN_MIN_DOLVOL:    '0'      # 成交额门槛，0=不限。收紧写 2000000000
         run: node scripts/candle-alert.mjs
