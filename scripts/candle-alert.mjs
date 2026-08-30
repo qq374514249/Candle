@@ -143,7 +143,7 @@ const toBars = (r) => {
   for (let i = 0; i < r.timestamp.length; i++) {
     const [o, h, l, c] = [q.open[i], q.high[i], q.low[i], q.close[i]];
     if ([o, h, l, c].some((v) => v == null || !isFinite(v))) continue;
-    out.push({ t: r.timestamp[i], o, h, l, c,
+    out.push({ t: r.timestamp[i], o, h, l, c, v: q.volume?.[i] ?? 0,
       d: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' })
            .format(new Date(r.timestamp[i] * 1000)) });
   }
@@ -182,7 +182,7 @@ async function fetchDailyTD(ticker, tries = 3, out = 600) {
       const bars = j.values.slice().reverse().map((v) => ({    // 返回是新→旧，要反过来
         d: v.datetime,
         t: Math.floor(Date.parse(`${v.datetime}T16:00:00-04:00`) / 1000),
-        o: +v.open, h: +v.high, l: +v.low, c: +v.close,
+        o: +v.open, h: +v.high, l: +v.low, c: +v.close, v: +v.volume || 0,
       })).filter((b) => [b.o, b.h, b.l, b.c].every(isFinite));
       if (bars.length) return bars;
       throw new Fatal('返回空数据');
@@ -298,10 +298,17 @@ const SCAN = {
 // 低于这个区间的 6 只全部亏损。切点是看了结果画的（n=16），只当参考不当定律。
 const SAFE = { dolVol: 2e9, price: 50 };
 
+// Yahoo 榜单挂了时的备用名单：常见高流动性美股（固定 8 只以外），
+// 会用各自的日线自行算成交额再排序，不依赖任何榜单接口。
+const FALLBACK_UNIVERSE = (process.env.SCAN_FALLBACK
+  || 'INTC,MU,AVGO,PLTR,COIN,SMCI,MRVL,QCOM,TXN,CRM,NFLX,ORCL,UBER,BAC,JPM,XOM,DIS,BA,SHOP,ARM')
+  .split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
+
 /** Yahoo 成交最活跃榜，然后按「成交额」重排（原榜是按股数，会全是低价股） */
 async function fetchMovers() {
+  // 只有这一个请求，值得多等一会儿：4 次尝试、退避到 20 秒
   const j = await yahoo('/v1/finance/screener/predefined/saved'
-                      + `?scrIds=most_actives&count=${SCAN.pool}&formatted=false`, 2, 2000);
+                      + `?scrIds=most_actives&count=${SCAN.pool}&formatted=false`, 4, 3500);
   const q = j?.finance?.result?.[0]?.quotes;
   if (!Array.isArray(q) || !q.length) throw new Error('榜单为空');
   return q
@@ -315,7 +322,14 @@ async function fetchMovers() {
     .slice(0, SCAN.top);
 }
 
-/** 对榜单里的每只股票算 G3 买入信号，返回今天有信号的 */
+/** 近 20 根日线的平均成交额，用于备用名单自己排序 */
+function avgDollarVol(bars, n = 20) {
+  const t = bars.slice(-n);
+  const v = t.filter((b) => b.v > 0);
+  return v.length ? v.reduce((a, b) => a + b.c * b.v, 0) / v.length : 0;
+}
+
+/** 对每只候选股算 G3 买入信号，返回今天有信号的 */
 async function scanHits(movers, fetchFn, gap) {
   const hits = [], failed = [];
   for (const m of movers) {
@@ -324,15 +338,19 @@ async function scanHits(movers, fetchFn, gap) {
       if (bars.length < WIN + 5) { failed.push(`${m.sym}(数据不足)`); continue; }
       const sig = signals(bars);
       const last = sig[sig.length - 1];
+      const lastBar = bars[bars.length - 1];
+      // 榜单给了成交额就用榜单的；备用名单没有，就用日线自己算
+      const px = m.px ?? lastBar.c;
+      const dv = m.dv ?? avgDollarVol(bars);
       if (last.buy !== 0) {
-        hits.push({ ...m, dir: last.buy, xr: last.xr, bars,
-                    rv: realizedVol(bars), gap: gapTrigger(bars),
-                    lastBar: bars[bars.length - 1],
-                    safe: m.dv >= SAFE.dolVol && m.px >= SAFE.price });
+        hits.push({ sym: m.sym, px, dv, dir: last.buy, xr: last.xr, bars,
+                    rv: realizedVol(bars), gap: gapTrigger(bars), lastBar,
+                    safe: dv >= SAFE.dolVol && px >= SAFE.price });
       }
     } catch (e) { failed.push(`${m.sym}(${String(e.message).slice(0, 30)})`); }
     await sleep(jitter(gap));
   }
+  hits.sort((a, b) => b.dv - a.dv);
   return { hits, failed };
 }
 
@@ -493,6 +511,13 @@ function realizedVol(bars, n = 60) {
   return sd * Math.sqrt(252);
 }
 
+const START = (process.env.START_DATE || '').trim();   // 例 '2026-08-31'，留空=按两年历史完整重放
+
+/**
+ * 重放持仓。指标仍用全部历史算（60日分位需要），
+ * 但设了 START_DATE 之后，只允许「执行日 >= START_DATE」的开仓单成立 ——
+ * 在第 i 根发出的开仓单是在第 i+1 根的开盘执行的，所以判断的是下一根的日期。
+ */
 function replay(bars, sig) {
   let pos = 0, ep = 0, epDate = null, pend = 0, trades = 0, wins = 0, eq = 1;
   const cost = 0.0005;
@@ -514,7 +539,9 @@ function replay(bars, sig) {
     }
     // 3. 生成明日挂单
     if (pos === 0) {
-      if (sig[i].buy !== 0 && (ALLOW_SHORT || sig[i].buy === 1)) pend = sig[i].buy;
+      const execDate = i + 1 < bars.length ? bars[i + 1].d : '9999-12-31';  // 最后一根 → 下一个开盘
+      const allowed = !START || execDate >= START;
+      if (allowed && sig[i].buy !== 0 && (ALLOW_SHORT || sig[i].buy === 1)) pend = sig[i].buy;
     } else if (sig[i].sell === -pos) pend = -99;
   }
   return { pos, ep, epDate, pend, trades, wins, eq };
@@ -594,7 +621,9 @@ const OPT_FOOT = `<i>期权回测：这类合约每笔均值 ${(HIST.optAvg * 10
 function scanBlock(scan, opts) {
   if (!scan) return [];
   const { hits, failed, n } = scan;
-  const L = ['', `<u>🔍 热股扫描</u>　<i>(成交额前 ${n} 名，固定名单以外)</i>`];
+  const L = ['', scan.src === '备用名单'
+    ? `<u>🔍 热股扫描</u>　<i>(⚠️ Yahoo 榜单取不到，改用 ${n} 只高流动性备用名单)</i>`
+    : `<u>🔍 热股扫描</u>　<i>(成交额前 ${n} 名，固定名单以外)</i>`];
   if (!hits.length) {
     L.push('　无 —— 今天没扫到新机会。');
   } else {
@@ -769,20 +798,28 @@ async function main() {
     }
   }
 
-  // 热股扫描：从成交额榜里找固定名单以外、今天有买入信号的股票
+  // 热股扫描：榜单打不通就退到备用名单，不让整个扫描因为一个接口挂掉
   let scan = null;
   if (SCAN.on && SCAN.sessions.includes(sess)) {
+    let movers = null, src = '热股榜';
     try {
-      if (!CRUMB) await warmup();                 // 榜单接口也要 crumb
-      const movers = await fetchMovers();
+      if (!CRUMB) await warmup();                 // 榜单接口要 crumb
+      movers = await fetchMovers();
       console.log(`热股榜取到 ${movers.length} 只：${movers.map((m) => m.sym).join(' ')}`);
-      // 用刚才真正取数成功的那个源，别再用打不通的主源
-      const r = await scanHits(movers, working.short, working.gap);
-      console.log(`扫描用 ${working.name} 取数`);
-      scan = { ...r, n: movers.length };
-      console.log(`扫描命中 ${r.hits.length} 只${r.failed.length ? '，失败 ' + r.failed.join(',') : ''}`);
     } catch (e) {
-      errs.push(`热股扫描(${e.message})`);
+      console.log(`热股榜取不到（${e.message}），改用备用名单`);
+      src = '备用名单';
+      movers = FALLBACK_UNIVERSE.filter((t) => !TICKERS.includes(t)).map((sym) => ({ sym }));
+    }
+    if (movers?.length) {
+      const r = await scanHits(movers, working.short, working.gap);
+      // 备用名单没有榜单排序，用各自算出来的成交额排完再取前 N
+      const hits = src === '热股榜' ? r.hits : r.hits.slice(0, SCAN.top);
+      scan = { hits, failed: r.failed, n: movers.length, src };
+      console.log(`扫描(${src}, ${working.name}) 命中 ${hits.length} 只`
+                + `${r.failed.length ? '，失败 ' + r.failed.length + ' 只' : ''}`);
+    } else {
+      errs.push('热股扫描(无候选)');
     }
   }
 
