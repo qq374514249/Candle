@@ -1,0 +1,47 @@
+name: 蜡烛图信号提醒
+
+on:
+  schedule:
+    # GitHub cron 只认 UTC，所以每个时段写两个时点（夏令时 / 冬令时各一个），
+    # 脚本会按美东时间判断，只有落在窗口内的那一次会真的发消息。
+    - cron: '45 12,13 * * 1-5'   # 盘前  美东 08:45
+    - cron: '30 16,17 * * 1-5'   # 盘中  美东 12:30
+    - cron: '30 20,21 * * 1-5'   # 盘后  美东 16:30
+  workflow_dispatch:
+    inputs:
+      session:
+        description: '强制发送哪个时段（留空则按当前时间判断）'
+        required: false
+        type: choice
+        options: ['', 'PRE', 'MID', 'POST']
+        default: ''
+      dry_run:
+        description: '只打印不发送'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: candle-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 发送信号
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_SESSION:      ${{ inputs.session }}
+          DRY_RUN:            ${{ inputs.dry_run && '1' || '' }}
+          ALLOW_SHORT:        '1'      # 改成 '0' 则只发做多信号
+          QUIET_INTRADAY:     '0'      # 改成 '1' 则盘中无异常时不发消息
+        run: node scripts/candle-alert.mjs
