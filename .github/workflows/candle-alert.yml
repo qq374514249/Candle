@@ -47,4 +47,7 @@ jobs:
           DRY_RUN:            ${{ inputs.dry_run && '1' || '' }}
           ALLOW_SHORT:        '1'      # 改成 '0' 则只发做多信号
           QUIET_INTRADAY:     '0'      # 改成 '1' 则盘中无异常时不发消息
+          OPTION_ENABLE:      '1'      # 改成 '0' 则只发股票信号，不推荐期权合约
+          OPTION_BUDGET:      '500'    # 每笔期权想投入多少美元
+          OPTION_DELTA:       '0.55'   # 目标 delta：0.5≈平值，0.7≈实值更像正股
         run: node scripts/candle-alert.mjs
