@@ -390,52 +390,160 @@ const bs = (S, K, T, v, call) => {                      // Black-Scholes（无�
   return { px, delta: call ? ncdf(d1) : ncdf(d1) - 1 };
 };
 
-/** 挑一张合约：先选到期日，再在该到期日里选最接近目标 delta 的流动合约 */
-async function pickOption(ticker, dir, spotHint) {
-  const call = dir === 1;
+// 期权链数据源：谁有 key 就用谁，都没配就退回 Yahoo（会被 GitHub 的 IP 限流）
+const TRADIER_TOKEN = process.env.TRADIER_TOKEN || '';
+const TRADIER_BASE  = process.env.TRADIER_BASE
+  || (process.env.TRADIER_LIVE === '1' ? 'https://api.tradier.com'
+                                       : 'https://sandbox.tradier.com');
+const MD_TOKEN = process.env.MARKETDATA_TOKEN || '';
+const PROBE = process.env.OPTIONS_PROBE === '1';   // 打印原始返回，用来核对字段名
+
+const num = (v) => { const x = Number(v); return isFinite(x) ? x : null; };
+const dteOf = (iso) => Math.round((Date.parse(`${iso}T20:00:00Z`) - Date.now()) / 86400000);
+
+/** 从到期日列表里挑最接近目标 DTE 的那个 */
+function pickExpiry(cands) {
+  const ok = cands.filter((c) => c.dte >= OPT.dteMin && c.dte <= OPT.dteMax);
+  if (!ok.length) throw new Error(`${OPT.dteMin}~${OPT.dteMax}天内无到期日`);
+  return ok.sort((x, y) => Math.abs(x.dte - OPT.dteWant) - Math.abs(y.dte - OPT.dteWant))[0];
+}
+
+/** Tradier：沙盒延迟15分钟（免费、不用入金）；开了券商账户把 TRADIER_LIVE 设成 1 就是实时 */
+async function chainTradier(ticker, call, spot) {
+  const H = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: 'application/json' };
+  const get = async (path) => {
+    const r = await fetch(`${TRADIER_BASE}${path}`, { headers: H });
+    if (r.status === 401 || r.status === 403) throw new Fatal(`token 无效(${r.status})`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  };
+  const e = await get(`/v1/markets/options/expirations?symbol=${ticker}&includeAllRoots=true`);
+  const dates = e?.expirations?.date
+    ?? (e?.expirations?.expiration ?? []).map((x) => x.date);
+  if (!dates?.length) throw new Error('无到期日');
+  const exp = pickExpiry(dates.map((d) => ({ d, dte: dteOf(d) })));
+
+  let S = spot;
+  try {                                          // 标的报价：链里没有，单独取一次
+    const q = await get(`/v1/markets/quotes?symbols=${ticker}`);
+    let qq = q?.quotes?.quote;
+    if (Array.isArray(qq)) qq = qq[0];
+    S = num(qq?.last) ?? num(qq?.close) ?? num(qq?.prevclose) ?? spot;
+  } catch { /* 取不到就用日线收盘价 */ }
+
+  const c = await get(`/v1/markets/options/chains?symbol=${ticker}&expiration=${exp.d}&greeks=true`);
+  let raw = c?.options?.option;
+  if (!raw) throw new Error('链为空');
+  if (!Array.isArray(raw)) raw = [raw];
+  if (PROBE) console.log('[probe tradier]', JSON.stringify(raw[0]).slice(0, 800));
+  const rows = raw
+    .filter((x) => (x.option_type ?? x.type) === (call ? 'call' : 'put'))
+    .map((x) => ({
+      contractSymbol: x.symbol, strike: num(x.strike),
+      bid: num(x.bid), ask: num(x.ask),
+      openInterest: num(x.open_interest) ?? 0, volume: num(x.volume) ?? 0,
+      iv: num(x.greeks?.mid_iv) ?? num(x.greeks?.smv_vol),
+      d: num(x.greeks?.delta),
+    }));
+  if (!rows.length) throw new Error('该到期日无对应方向合约');
+  return { rows, exp, S };
+}
+
+/** MarketData.app：一次请求拿到指定 DTE 的整条链，返回是列式数组 */
+async function chainMarketData(ticker, call, spot) {
+  const u = `https://api.marketdata.app/v1/options/chain/${ticker}/`
+          + `?dte=${OPT.dteWant}&side=${call ? 'call' : 'put'}&token=${MD_TOKEN}`;
+  const r = await fetch(u, { headers: { Accept: 'application/json' } });
+  const j = await r.json().catch(() => null);
+  if (r.status === 401 || r.status === 403) throw new Fatal(`token 无效(${r.status})`);
+  if (j?.s !== 'ok' || !j.optionSymbol?.length)
+    throw new Error(`${r.status}: ${String(j?.errmsg ?? '').slice(0, 50)}`);
+  if (PROBE) console.log('[probe marketdata]', JSON.stringify(Object.fromEntries(
+    Object.keys(j).filter((k) => Array.isArray(j[k])).map((k) => [k, j[k][0]]))).slice(0, 800));
+  const rows = j.optionSymbol.map((sym, i) => ({
+    contractSymbol: sym, strike: num(j.strike[i]),
+    bid: num(j.bid[i]), ask: num(j.ask[i]),
+    openInterest: num(j.openInterest?.[i]) ?? 0, volume: num(j.volume?.[i]) ?? 0,
+    iv: num(j.iv?.[i]), d: num(j.delta?.[i]),
+  }));
+  return { rows,
+           exp: { d: new Date(j.expiration[0] * 1000).toISOString().slice(0, 10), dte: j.dte[0] },
+           S: num(j.underlyingPrice?.[0]) ?? spot };
+}
+
+/** Yahoo：没有 greeks，delta 用 Black-Scholes 自己算 */
+async function chainYahoo(ticker, call, spot) {
   const a = await yahoo(`/v7/finance/options/${ticker}`, 2, 2000);
   const r0 = a?.optionChain?.result?.[0];
   if (!r0?.expirationDates?.length) throw new Error('拿不到到期日列表');
   const now = Date.now() / 1000;
-  const cand = r0.expirationDates
-    .map((e) => ({ e, dte: Math.round((e - now) / 86400) }))
-    .filter((c) => c.dte >= OPT.dteMin && c.dte <= OPT.dteMax);
-  if (!cand.length) throw new Error(`${OPT.dteMin}~${OPT.dteMax} 天内没有到期日`);
-  const exp = cand.sort((x, y) => Math.abs(x.dte - OPT.dteWant) - Math.abs(y.dte - OPT.dteWant))[0];
+  const exp = pickExpiry(r0.expirationDates.map((e) => ({
+    d: new Date(e * 1000).toISOString().slice(0, 10),
+    dte: Math.round((e - now) / 86400), e })));
 
   await sleep(jitter(1200));
   const b = await yahoo(`/v7/finance/options/${ticker}?date=${exp.e}`, 2, 2000);
   const r = b?.optionChain?.result?.[0];
   const leg = r?.options?.[0]?.[call ? 'calls' : 'puts'] ?? [];
-  const S = r?.quote?.regularMarketPrice ?? spotHint;
+  const S = num(r?.quote?.regularMarketPrice) ?? spot;
   if (!leg.length || !S) throw new Error('期权链为空');
-
   const T = exp.dte / 365;
-  const rows = leg.map((c) => {
-    const mid = (c.bid + c.ask) / 2;
-    const spread = mid > 0 ? (c.ask - c.bid) / mid : 9;
-    const iv = c.impliedVolatility;
-    const d = iv > 0 ? bs(S, c.strike, T, iv, call).delta : NaN;
-    return { ...c, mid, spread, iv, d };
-  }).filter((c) => c.bid > 0 && c.ask > 0 && isFinite(c.d)
-                && c.openInterest >= OPT.minOI && c.spread <= OPT.maxSpread);
-  if (!rows.length) throw new Error('没有满足流动性要求的合约');
+  const rows = leg.map((c) => ({
+    contractSymbol: c.contractSymbol, strike: num(c.strike),
+    bid: num(c.bid), ask: num(c.ask),
+    openInterest: num(c.openInterest) ?? 0, volume: num(c.volume) ?? 0,
+    iv: num(c.impliedVolatility),
+    d: c.impliedVolatility > 0 ? bs(S, c.strike, T, c.impliedVolatility, call).delta : null,
+  }));
+  return { rows, exp, S };
+}
 
-  const best = rows.sort((x, y) => Math.abs(Math.abs(x.d) - OPT.delta)
-                                 - Math.abs(Math.abs(y.d) - OPT.delta))[0];
-  const cost = best.ask * 100;                          // 按卖价买入，最保守
-  const n = Math.max(1, Math.floor(OPT.budget / cost));
-  const be = call ? (best.strike + best.ask) / S - 1 : 1 - (best.strike - best.ask) / S;
+function optionProviders() {
+  const list = [];
+  if (TRADIER_TOKEN) list.push({ name: `Tradier${TRADIER_BASE.includes('sandbox') ? '沙盒' : ''}`, fn: chainTradier });
+  if (MD_TOKEN)      list.push({ name: 'MarketData', fn: chainMarketData });
+  list.push({ name: 'Yahoo', fn: chainYahoo });
+  return list;
+}
 
-  // 情景：持有到回测的中位持仓天数（3 个交易日 ≈ 4 个自然日）后，标的走 x% 时这张合约值多少
-  const Th = Math.max(0, (exp.dte - 4)) / 365;
-  const scen = [HIST.win, HIST.avg, 0, HIST.loss, -0.08].map((m) => {
-    const S2 = S * (1 + (call ? m : -m));               // 做空时标的下跌才有利
-    const v = bs(S2, best.strike, Th, best.iv, call).px;
-    return { m, opt: v / best.ask - 1 };
-  });
-  return { exp, dte: exp.dte, S, c: best, cost, n, be, scen, call,
-           expDate: new Date(exp.e * 1000).toISOString().slice(0, 10) };
+/** 挑一张合约：按目标 delta + 流动性筛选；数据源依次尝试，前面的挂了自动用下一个 */
+async function pickOption(ticker, dir, spotHint) {
+  const call = dir === 1;
+  const errs = [];
+  for (const p of optionProviders()) {
+    let chain;
+    try { chain = await p.fn(ticker, call, spotHint); }
+    catch (e) { errs.push(`${p.name}:${e.message}`); continue; }
+
+    const T = Math.max(chain.exp.dte, 0) / 365;
+    const S = chain.S;
+    const rows = chain.rows.map((c) => {
+      const mid = (c.bid + c.ask) / 2;
+      const d = c.d ?? (c.iv > 0 && S ? bs(S, c.strike, T, c.iv, call).delta : NaN);
+      return { ...c, mid, d, spread: mid > 0 ? (c.ask - c.bid) / mid : 9 };
+    }).filter((c) => c.bid > 0 && c.ask > 0 && isFinite(c.d) && c.strike > 0
+                  && c.openInterest >= OPT.minOI && c.spread <= OPT.maxSpread);
+    if (!rows.length) { errs.push(`${p.name}:无满足流动性的合约`); continue; }
+    // 标的价必须落在行权价区间内，否则是标的价和链对不上（换过股、取错代码、报价源串了）
+    const ks = rows.map((c) => c.strike);
+    if (!S || S < Math.min(...ks) * 0.6 || S > Math.max(...ks) * 1.4) {
+      errs.push(`${p.name}:标的价 ${money(S)} 与行权价区间 ${money(Math.min(...ks))}~${money(Math.max(...ks))} 不匹配`);
+      continue;
+    }
+
+    const best = rows.sort((x, y) => Math.abs(Math.abs(x.d) - OPT.delta)
+                                   - Math.abs(Math.abs(y.d) - OPT.delta))[0];
+    const cost = best.ask * 100;
+    const n = Math.max(1, Math.floor(OPT.budget / cost));
+    const be = call ? (best.strike + best.ask) / S - 1 : 1 - (best.strike - best.ask) / S;
+    const iv = best.iv > 0 ? best.iv : 0.4;
+    const Th = Math.max(0, chain.exp.dte - 4) / 365;
+    const scen = [HIST.win, HIST.avg, 0, HIST.loss, -0.08].map((m) => ({
+      m, opt: bs(S * (1 + (call ? m : -m)), best.strike, Th, iv, call).px / best.ask - 1 }));
+    return { dte: chain.exp.dte, S, c: { ...best, iv }, cost, n, be, scen, call,
+             expDate: chain.exp.d, src: p.name };
+  }
+  throw new Error(errs.join(' / ') || '无可用期权数据源');
 }
 
 // ── 指标 ─────────────────────────────────────────────────────────
@@ -595,7 +703,7 @@ function optionBlock(t, s, o, brief = false) {
       + (c.iv > s.rv * 1.1 ? ' <b>(偏贵)</b>' : c.iv < s.rv * 0.9 ? ' (偏便宜)' : ' (合理)')
     : `IV ${(c.iv * 100).toFixed(0)}%`;
   const L = [
-    `　└ <b>${t} ${o.expDate} ${side} ${c.strike}</b>　${o.dte}天到期`,
+    `　└ <b>${t} ${o.expDate} ${side} ${c.strike}</b>　${o.dte}天到期　<i>${o.src}</i>`,
     `　　买/卖 ${money(c.bid)} / ${money(c.ask)}　delta ${Math.abs(c.d).toFixed(2)}　${ivTxt}`,
     `　　成本 <b>$${o.cost.toFixed(0)}/张</b>　预算 $${OPT.budget} → <b>${o.n} 张</b>`
       + `${o.cost > OPT.budget ? ' <b>(超预算，这一张就超了)</b>' : ''}　未平仓 ${c.openInterest}`,
