@@ -82,55 +82,178 @@ function session(et) {
   return null;
 }
 
-// ── 取数：Yahoo Finance ───────────────────────────────────────────
+// ── 取数：Yahoo 主源 + Twelve Data 备源 ───────────────────────────
 const HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const TD_KEY = process.env.TWELVEDATA_API_KEY || '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (ms) => ms * (0.7 + Math.random() * 0.6);
 
-/** 两个 Yahoo 域名各试两轮，失败退避重试（偶发 403/429 很常见） */
-async function yahoo(path) {
+let COOKIE = '';
+/** 先拿一次 Yahoo 的 cookie —— 带 cookie 的请求被限流的概率明显低一些 */
+async function warmup() {
+  try {
+    const r = await fetch('https://fc.yahoo.com', { headers: { 'User-Agent': UA } });
+    const sc = r.headers.getSetCookie?.() ?? [];
+    COOKIE = sc.map((c) => c.split(';')[0]).join('; ');
+    if (COOKIE) console.log('已取得 Yahoo cookie');
+  } catch { /* 拿不到就算了，不影响后续 */ }
+}
+
+const YH_HEADERS = () => ({
+  'User-Agent': UA,
+  'Accept': 'application/json,text/plain,*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer': 'https://finance.yahoo.com/',
+  ...(COOKIE ? { Cookie: COOKIE } : {}),
+});
+
+/** 单次 Yahoo 请求，内部小步重试；429 会按 Retry-After 等待 */
+async function yahoo(path, tries = 2, base = 2500) {
   let last;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const host = HOSTS[attempt % HOSTS.length];
+  for (let a = 0; a < tries; a++) {
+    const host = HOSTS[a % HOSTS.length];
     try {
-      const res = await fetch(`https://${host}${path}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                      + 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-          'Accept': 'application/json',
-        },
-      });
+      const res = await fetch(`https://${host}${path}`, { headers: YH_HEADERS() });
       if (res.ok) return await res.json();
       last = new Error(`HTTP ${res.status}`);
-    } catch (e) { last = e; }
-    await sleep(400 * (attempt + 1));
+      if (res.status === 404) throw last;                       // 代码写错了，重试没用
+      const ra = Number(res.headers.get('retry-after')) || 0;
+      if (a < tries - 1) await sleep(Math.max(ra * 1000, jitter(base * (a + 1))));
+    } catch (e) {
+      last = e;
+      if (String(e.message).includes('404')) throw e;
+      if (a < tries - 1) await sleep(jitter(base * (a + 1)));
+    }
   }
   throw last;
 }
 
-// ── 取数：Yahoo Finance 日线 ──────────────────────────────────────
-async function fetchDaily(ticker, range = '2y') {
-  const j = await yahoo(`/v8/finance/chart/${ticker}`
-                      + `?range=${range}&interval=1d&includePrePost=false`);
-  const r = j?.chart?.result?.[0];
-  if (!r) throw new Error(`${ticker}: 无数据 ${j?.chart?.error?.description ?? ''}`);
-  const q = r.indicators.quote[0];
-  const out = [];
+const toBars = (r) => {
+  const q = r.indicators.quote[0], out = [];
   for (let i = 0; i < r.timestamp.length; i++) {
     const [o, h, l, c] = [q.open[i], q.high[i], q.low[i], q.close[i]];
     if ([o, h, l, c].some((v) => v == null || !isFinite(v))) continue;
-    out.push({
-      t: r.timestamp[i], o, h, l, c,
+    out.push({ t: r.timestamp[i], o, h, l, c,
       d: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' })
-           .format(new Date(r.timestamp[i] * 1000)),
-    });
+           .format(new Date(r.timestamp[i] * 1000)) });
   }
   return out;
+};
+
+async function fetchDailyYahoo(ticker, range = '2y') {
+  const j = await yahoo(`/v8/finance/chart/${ticker}`
+                      + `?range=${range}&interval=1d&includePrePost=false`);
+  const r = j?.chart?.result?.[0];
+  if (!r) throw new Error(j?.chart?.error?.description ?? '无数据');
+  return toBars(r);
 }
 
-/** 盘中实时报价（用于止损监控） */
+/** 认证/代码错误这类重试也没用的错误，标记出来直接放弃，不要空转 */
+class Fatal extends Error { constructor(m) { super(m); this.fatal = true; } }
+
+/** Twelve Data：免费 key 即可。限流按 key 计，不受 GitHub 服务器 IP 影响 */
+async function fetchDailyTD(ticker, tries = 3) {
+  if (!TD_KEY) throw new Fatal('未配置 TWELVEDATA_API_KEY');
+  const SC = Number(process.env.RETRY_SCALE || 1);
+  const u = `https://api.twelvedata.com/time_series?symbol=${ticker}`
+          + `&interval=1day&outputsize=600&apikey=${TD_KEY}`;
+  let last;
+  for (let a = 0; a < tries; a++) {
+    let j, status;
+    try {
+      const res = await fetch(u, { headers: { 'User-Agent': UA } });
+      status = res.status; j = await res.json();
+    } catch (e) {
+      last = e;
+      if (a < tries - 1) await sleep(jitter(3000 * (a + 1) * SC));
+      continue;
+    }
+    if (j.status === 'ok' && Array.isArray(j.values)) {
+      const bars = j.values.slice().reverse().map((v) => ({    // 返回是新→旧，要反过来
+        d: v.datetime,
+        t: Math.floor(Date.parse(`${v.datetime}T16:00:00-04:00`) / 1000),
+        o: +v.open, h: +v.high, l: +v.low, c: +v.close,
+      })).filter((b) => [b.o, b.h, b.l, b.c].every(isFinite));
+      if (bars.length) return bars;
+      throw new Fatal('返回空数据');
+    }
+    const code = j.code ?? status;
+    const msg = `${code}: ${String(j.message ?? '').slice(0, 70)}`;
+    if ([401, 403, 404, 400].includes(code)) throw new Fatal(msg);   // key 错 / 代码错，重试无用
+    last = new Error(msg);
+    if (code === 429 && a < tries - 1) { await sleep(62000 * SC); continue; }  // 每分钟额度用完
+    if (a < tries - 1) await sleep(jitter(3000 * (a + 1) * SC));
+  }
+  throw last;
+}
+
+/**
+ * 串行取数。主源分三轮重试（打不通就等一会儿再打），最后还缺的交给备源。
+ * 只要有一只成功就照常发消息，不会因为个别失败整个任务红叉。
+ *
+ * DATA_SOURCE = auto      配了 TD key 就用 TD 打头、Yahoo 兜底；没配就只用 Yahoo（默认）
+ *             = twelvedata 强制 TD 打头
+ *             = yahoo      强制 Yahoo 打头
+ */
+async function fetchAll(tickers) {
+  const mode = (process.env.DATA_SOURCE || 'auto').toLowerCase();
+  const tdFirst = mode === 'twelvedata' || (mode === 'auto' && !!TD_KEY);
+  const SC = Number(process.env.RETRY_SCALE || 1);
+  const SRC = {
+    yahoo:      { name: 'Yahoo',       fn: fetchDailyYahoo, gap: 1500 * SC, warm: true },
+    twelvedata: { name: 'TwelveData',  fn: fetchDailyTD,    gap: 8000 * SC, warm: false },
+  };
+  const primary = tdFirst ? SRC.twelvedata : SRC.yahoo;
+  const backup  = tdFirst ? SRC.yahoo : (TD_KEY ? SRC.twelvedata : null);
+  console.log(`主源 ${primary.name}${backup ? ` · 备源 ${backup.name}` : ' · 无备源'}`);
+
+  const bars = {}, errs = {};
+  let warmed = false;
+  const pass = async (src, list, gapMul = 1) => {
+    if (src.warm && !warmed) { await warmup(); warmed = true; }
+    let fatal = 0;
+    for (const t of list) {
+      try { bars[t] = await src.fn(t); delete errs[t]; }
+      catch (e) { errs[t] = `${src.name} ${e.message}`; if (e.fatal) fatal++; }
+      await sleep(jitter(src.gap * gapMul));
+    }
+    return { got: list.filter((t) => bars[t]).length, fatal };
+  };
+
+  // 第 1 轮主源
+  let r1 = await pass(primary, tickers);
+  // 主源一只都没成 → 别再空转，直接切备源
+  const bail = r1.got === 0;
+  if (bail && backup) console.log(`${primary.name} 整批失败${r1.fatal ? '（配置错误）' : ''}，直接切 ${backup.name}`);
+
+  if (!bail) {
+    for (const [i, wait] of [30000 * SC, 60000 * SC].entries()) {
+      const todo = tickers.filter((t) => !bars[t]);
+      if (!todo.length) break;
+      console.log(`还差 ${todo.join('/')} —— 等 ${wait / 1000}s 再试`);
+      await sleep(wait);
+      await pass(primary, todo, 1.6 + i);
+    }
+  }
+
+  if (backup) {
+    const todo = tickers.filter((t) => !bars[t]);
+    if (todo.length) {
+      const before = Object.keys(bars).length;
+      await pass(backup, todo);
+      const got = Object.keys(bars).length - before;
+      if (got) console.log(`备源 ${backup.name} 补上 ${got} 只`);
+    }
+  }
+  return { bars, errs };
+}
+
+/** 盘中实时报价（用于止损监控）—— 取不到就跳过，不影响主消息 */
 async function fetchQuote(ticker) {
   let j;
-  try { j = await yahoo(`/v8/finance/chart/${ticker}?range=1d&interval=1m`); }
+  try { j = await yahoo(`/v8/finance/chart/${ticker}?range=1d&interval=1m`, 2, 1500); }
   catch { return null; }
   const r = j?.chart?.result?.[0];
   const meta = r?.meta;
@@ -358,25 +481,31 @@ async function main() {
     return;
   }
 
+  const { bars: allBars, errs: fetchErrs } = await fetchAll(TICKERS);
+
   const states = {}, errs = [];
-  await Promise.all(TICKERS.map(async (t) => {
-    try {
-      const bars = await fetchDaily(t);
-      if (bars.length < WIN + 5) throw new Error('\u5386\u53f2\u6570\u636e\u4e0d\u8db3');
-      const sig = signals(bars);
-      const st = replay(bars, sig);
-      st.last = bars[bars.length - 1];
-      st.lastSig = sig[sig.length - 1];
-      st.gap = gapTrigger(bars);
-      states[t] = st;
-    } catch (e) { errs.push(`${t}: ${e.message}`); }
-  }));
-  if (!Object.keys(states).length) throw new Error(`\u5168\u90e8\u53d6\u6570\u5931\u8d25: ${errs.join('; ')}`);
+  for (const t of TICKERS) {
+    const bars = allBars[t];
+    if (!bars) { errs.push(`${t}(${fetchErrs[t]})`); continue; }
+    if (bars.length < WIN + 5) { errs.push(`${t}(历史数据不足)`); continue; }
+    const sig = signals(bars);
+    const st = replay(bars, sig);
+    st.last = bars[bars.length - 1];
+    st.lastSig = sig[sig.length - 1];
+    st.gap = gapTrigger(bars);
+    states[t] = st;
+  }
+  const okN = Object.keys(states).length;
+  if (!okN) throw new Error(`全部取数失败: ${errs.join('; ')}`);
+  console.log(`取数成功 ${okN}/${TICKERS.length}${errs.length ? '，失败: ' + errs.join('; ') : ''}`);
 
   const quotes = {};
   const holding = TICKERS.filter((t) => states[t] && states[t].pos !== 0);
   if (sess === 'MID') {
-    await Promise.all(holding.map(async (t) => { quotes[t] = await fetchQuote(t); }));
+    for (const t of holding) {                    // 串行，避免又被限流
+      quotes[t] = await fetchQuote(t);
+      await sleep(jitter(1200));
+    }
   } else if (sess === 'CLOSED') {
     // 休市没有实时价，用最近一个交易日的收盘价来算浮盈亏
     for (const t of holding) {
@@ -398,7 +527,7 @@ async function main() {
   console.log(`\u5df2\u53d1\u9001 ${sess} \u63d0\u9192\uff08${text.length} \u5b57\u7b26\uff09`);
 }
 
-export { signals, replay, pctRank, buildMessage, gapTrigger, etParts, session, isTradingDay,
+export { signals, replay, pctRank, buildMessage, gapTrigger, fetchDailyTD, etParts, session, isTradingDay,
          TICKERS, WIN, HI, LO, STOP };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
