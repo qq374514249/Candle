@@ -29,7 +29,7 @@ concurrency:
 jobs:
   alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +41,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          DATA_SOURCE:        'auto'   # auto=配了 key 就用 TwelveData 打头、Yahoo 兜底；也可写死 yahoo / twelvedata
           FORCE_SESSION:      ${{ inputs.session }}
           DRY_RUN:            ${{ inputs.dry_run && '1' || '' }}
           ALLOW_SHORT:        '1'      # 改成 '0' 则只发做多信号
