@@ -5,7 +5,7 @@ on:
     # GitHub cron 只认 UTC，所以每个时段写两个时点（夏令时 / 冬令时各一个），
     # 脚本会按美东时间判断，只有落在窗口内的那一次会真的发消息。
     - cron: '45 12,13 * * 1-5'   # 盘前  美东 08:45
-    - cron: '30 16,17 * * 1-5'   # 盘中  美东 12:30
+    - cron: '0 14-20 * * 1-5'    # 盘中  美东 10:00–15:00 每小时查一次止损（没事不发消息）
     - cron: '30 20,21 * * 1-5'   # 盘后  美东 16:30
     - cron: '30 14,15 * * *'     # 休市  美东 10:30（周末与假日播报；交易日自动跳过）
   workflow_dispatch:
@@ -43,15 +43,16 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           DATA_SOURCE:        'auto'   # auto=配了 key 就用 TwelveData 打头、Yahoo 兜底；也可写死 yahoo / twelvedata
+          SCHEDULE:           ${{ github.event.schedule }}   # 让脚本知道是哪条 cron 触发的
           FORCE_SESSION:      ${{ inputs.session }}
           DRY_RUN:            ${{ inputs.dry_run && '1' || '' }}
           START_DATE:         '2026-08-31'  # 从这一天的开盘起才允许开仓，此前一律当作空仓。
                                             # 设一次就不用再动；留空则按两年历史完整重放。
           ALLOW_SHORT:        '1'      # 改成 '0' 则只发做多信号
-          QUIET_INTRADAY:     '0'      # 改成 '1' 则盘中无异常时不发消息
+          QUIET_INTRADAY:     '1'      # 盘中每小时查一次，只在逼近/触及止损时才发；'0' 则每次都发
           SCAN_ENABLE:        '1'      # 扫描热股榜找新机会；'0' 关闭
           SCAN_SESSIONS:      'PRE,CLOSED'  # 在哪几条消息里扫（盘前 + 休市，都是「下一个开盘前」）
           SCAN_TOP:           '10'     # 按成交额取前几名
-          SCAN_MIN_PRICE:     '10'     # 股价门槛。想只留验证过的那类股票就改成 50
-          SCAN_MIN_DOLVOL:    '0'      # 成交额门槛，0=不限。收紧写 2000000000
+          SCAN_MIN_PRICE:     '50'          # 只留验证过的那类股票（回测里这条线以下 6/6 全亏）
+          SCAN_MIN_DOLVOL:    '2000000000'  # 日成交额 ≥$2B
         run: node scripts/candle-alert.mjs
